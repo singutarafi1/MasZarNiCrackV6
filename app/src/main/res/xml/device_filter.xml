@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- MediaTek (VID 0x0E8D = 3725) -->
+    <usb-device vendor-id="3725" product-id="3" />      <!-- BROM 0x0003 -->
+    <usb-device vendor-id="3725" product-id="8192" />   <!-- Preloader 0x2000 -->
+    <usb-device vendor-id="3725" product-id="8193" />   <!-- DA VCOM 0x2001 -->
+    <usb-device vendor-id="3725" product-id="8196" />   <!-- CDC / META 0x2004 -->
+    <usb-device vendor-id="3725" product-id="8197" />   <!-- Debug / META 0x2005 -->
+    <usb-device vendor-id="3725" product-id="8199" />   <!-- META 0x2007 -->
+    <usb-device vendor-id="3725" product-id="8202" />   <!-- META 0x200A -->
+    <usb-device vendor-id="3725" product-id="1" />
+    <usb-device vendor-id="3725" product-id="2" />
+    <usb-device vendor-id="3725" product-id="5" />
+    <usb-device vendor-id="3725" />
+
+    <!-- Qualcomm (VID 0x05C6 = 1478): EDL 9008, Diag 9091/901D/9025 -->
+    <usb-device vendor-id="1478" product-id="36872" />  <!-- EDL 0x9008 -->
+    <usb-device vendor-id="1478" product-id="37009" />  <!-- Diag 0x9091 -->
+    <usb-device vendor-id="1478" product-id="36893" />  <!-- Diag 0x901D -->
+    <usb-device vendor-id="1478" product-id="36901" />  <!-- Diag 0x9025 -->
+    <usb-device vendor-id="1478" />
+
+    <!-- ADB Interface (Class 0xFF=255, Subclass 0x42=66, Protocol 0x01=1) -->
+    <usb-device class="255" subclass="66" protocol="1" />
+    <!-- Fastboot Interface (Class 0xFF=255, Subclass 0x42=66, Protocol 0x03=3) -->
+    <usb-device class="255" subclass="66" protocol="3" />
+    <!-- Generic CDC-ACM Serial (META / Preloader clones) -->
+    <usb-device class="2" subclass="2" />
+
+    <!-- Google / Android Common Vendor ID (0x18D1) -->
+    <usb-device vendor-id="6353" />
+    <!-- Samsung USB Vendor ID (0x04E8) -->
+    <usb-device vendor-id="1256" />
+    <!-- Xiaomi / Generic Android Vendor IDs -->
+    <usb-device vendor-id="10007" />
+    <!-- Huawei USB Vendor ID (0x12D1) -->
+    <usb-device vendor-id="4817" />
+</resources>

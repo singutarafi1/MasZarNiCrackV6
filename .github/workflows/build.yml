@@ -1,0 +1,111 @@
+name: 🚀 Build Android APK & Native JNI USB (.so)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android:
+    name: 📱 Build APK + libjin_usb.so
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: ☕ Setup Java 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 🛠️ Install Android NDK & CMake
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "cmake;3.22.1" "ndk;27.2.12479018"
+
+      - name: 🐘 Setup Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: 🔑 Restore / Generate Debug Keystore & Verify Firebase Config
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+        run: |
+          if [ -n "$DEBUG_KEYSTORE_BASE64" ]; then
+            echo "Decoding debug.keystore from GitHub Secret..."
+            echo "$DEBUG_KEYSTORE_BASE64" | base64 -d > ./debug.keystore
+          elif [ -f "./debug.keystore.base64" ]; then
+            echo "Decoding debug.keystore from debug.keystore.base64..."
+            base64 -d ./debug.keystore.base64 > ./debug.keystore
+          elif [ ! -f "./debug.keystore" ]; then
+            echo "⚠️ Warning: debug.keystore.base64 not found; generating temporary debug.keystore (SHA-1 will differ from Firebase Google Sign-In)..."
+            keytool -genkey -v -keystore ./debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          ls -la ./debug.keystore
+
+          if [ -n "$GOOGLE_SERVICES_JSON_BASE64" ]; then
+            echo "Decoding app/google-services.json from GitHub Secret..."
+            echo "$GOOGLE_SERVICES_JSON_BASE64" | base64 -d > ./app/google-services.json
+          fi
+
+          if [ ! -f "./app/google-services.json" ]; then
+            echo "❌ ERROR: app/google-services.json is missing from the repository! Push app/google-services.json (or set GOOGLE_SERVICES_JSON_BASE64 secret)."
+            exit 1
+          fi
+          if grep -q "remixed-project-id" ./app/google-services.json; then
+            echo "❌ ERROR: app/google-services.json still contains placeholder 'remixed-project-id' without OAuth client_type 3!"
+            exit 1
+          fi
+          if ! grep -q '"client_type": 3' ./app/google-services.json; then
+            echo "❌ ERROR: app/google-services.json is missing OAuth client_type 3 (needed to generate default_web_client_id)."
+            exit 1
+          fi
+          echo "✅ Verified app/google-services.json contains OAuth client_type 3."
+
+      - name: 🔧 Grant Execute Permissions for Gradlew
+        run: |
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+          fi
+
+      - name: 📦 Build Android APK (Debug + libjin_usb.so)
+        run: |
+          if [ -f "./gradlew" ]; then
+            ./gradlew assembleDebug --no-build-cache --stacktrace -Djava.awt.headless=true -Dkotlin.compiler.execution.strategy=in-process
+          else
+            gradle assembleDebug --no-build-cache --stacktrace -Djava.awt.headless=true -Dkotlin.compiler.execution.strategy=in-process
+          fi
+
+      - name: 📤 Upload Android APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MTK-Service-Tool-Android-APK
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 📤 Upload Stripped .so Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libjin_usb-so-binaries
+          path: app/build/intermediates/stripped_native_libs/debug/stripDebugDebugSymbols/out/lib/**/*.so
+          retention-days: 30
+          if-no-files-found: warn

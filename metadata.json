@@ -1,0 +1,8 @@
+{
+  "name": "Remix MTK Multi-USB Service Tool",
+  "description": "Android native Kotlin service tool with libusb JNI driver (libjin_usb.so) for MTK BROM/Preloader/META, Qualcomm EDL/Diag, ADB, and Fastboot, built via GitHub Actions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

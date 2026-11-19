@@ -1,0 +1,2408 @@
+
+==================================================
+FILE: edl/Library/firehose_client.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2019
+
+import os
+import sys
+import logging
+import json
+from binascii import hexlify, unhexlify
+from struct import unpack, pack
+from edl.Library.firehose import firehose
+from edl.Library.xmlparser import xmlparser
+from edl.Library.utils import do_tcp_server
+from edl.Library.utils import LogBase, getint
+from edl.Config.qualcomm_config import memory_type
+from edl.Config.qualcomm_config import infotbl, msmids, secureboottbl, sochw
+
+try:
+    import xml.etree.cElementTree as ET
+    from xml.etree import cElementTree as ElementTree
+except ImportError:
+    import xml.etree.ElementTree as ET
+    from xml.etree import ElementTree
+
+try:
+    from edl.Library.Modules.init import modules
+except ImportError as e:
+    pass
+
+
+class firehose_client(metaclass=LogBase):
+    def __init__(self, arguments, cdc, sahara, loglevel, printer):
+        self.cdc = cdc
+        self.sahara = sahara
+        self.arguments = arguments
+        self.printer = printer
+        self.info = self.__logger.info
+        self.error = self.__logger.error
+        self.warning = self.__logger.warning
+        self.__logger.setLevel(loglevel)
+        if loglevel == logging.DEBUG:
+            logfilename = "log.txt"
+            fh = logging.FileHandler(logfilename)
+            self.__logger.addHandler(fh)
+
+        self.cfg = firehose.cfg()
+        if not arguments["--memory"] is None:
+            self.cfg.MemoryName = arguments["--memory"].lower()
+        else:
+            self.cfg.MemoryName = ""
+        self.cfg.ZLPAwareHost = 1
+        self.cfg.SkipStorageInit = arguments["--skipstorageinit"]
+        self.cfg.SkipWrite = arguments["--skipwrite"]
+        self.cfg.MaxPayloadSizeToTargetInBytes = getint(arguments["--maxpayload"])
+        self.cfg.SECTOR_SIZE_IN_BYTES = getint(arguments["--sectorsize"])
+        self.cfg.bit64 = sahara.bit64
+        devicemodel = ""
+        skipresponse = False
+        if "--skipresponse" in arguments:
+            if arguments["--skipresponse"]:
+                skipresponse = True
+        if "--devicemodel" in arguments:
+            if arguments["--devicemodel"] is not None:
+                devicemodel = arguments["--devicemodel"]
+        self.firehose = firehose(cdc, xmlparser(), self.cfg, self.__logger.level, devicemodel, sahara.serial,
+                                 skipresponse,
+                                 self.getluns(arguments), arguments)
+        self.connected = False
+        self.firehose.connect()
+        if "hwid" in dir(sahara):
+            if sahara.hwid is not None:
+                hwid = (sahara.hwid >> 32) & 0xFFFFFF
+                socid = ((sahara.hwid >> 32) >> 16)
+                if hwid in msmids:
+                    self.target_name = msmids[hwid]
+                    self.info(f"Target detected: {self.target_name}")
+                    if self.cfg.MemoryName == "":
+                        if self.target_name in memory_type.preferred_memory:
+                            type = memory_type.preferred_memory[self.target_name]
+                            if type == memory_type.nand:
+                                self.cfg.MemoryName = "nand"
+                            if type == memory_type.spinor:
+                                self.cfg.MemoryName = "spinor"
+                            elif type == memory_type.emmc:
+                                self.cfg.MemoryName = "eMMC"
+                            elif type == memory_type.ufs:
+                                self.cfg.MemoryName = "UFS"
+                            self.warning("Based on the chipset, we assume " +
+                                self.cfg.MemoryName + " as default memory type..., if it fails, try using " +
+                                "--memory\" with \"UFS\",\"NAND\" or \"spinor\" instead !")
+                elif socid in sochw:
+                    self.target_name = sochw[socid].split(",")[0]
+
+        # We assume ufs is fine (hopefully), set it as default
+        if self.cfg.MemoryName == "":
+            self.warning(
+                "No --memory option set, we assume \"eMMC\" as default ..., if it fails, try using \"--memory\" " +
+                "with \"UFS\",\"NAND\" or \"spinor\" instead !")
+            self.cfg.MemoryName = "eMMC"
+
+        if self.firehose.configure(0):
+            funcs = "Supported functions:\n-----------------\n"
+            for function in self.firehose.supported_functions:
+                funcs += function + ","
+            funcs = funcs[:-1]
+            self.info(funcs)
+            self.target_name = self.firehose.cfg.TargetName
+            self.connected = True
+            try:
+                if self.firehose.modules is None:
+                    self.firehose.modules = modules(fh=self.firehose, serial=self.firehose.serial,
+                                                    supported_functions=self.firehose.supported_functions,
+                                                    loglevel=self.__logger.level,
+                                                    devicemodel=self.firehose.devicemodel, args=self.arguments)
+            except Exception as err:  # pylint: disable=broad-except
+                self.firehose.modules = None
+
+    def check_cmd(self, func):
+        if not self.firehose.supported_functions:
+            return True
+        for sfunc in self.firehose.supported_functions:
+            if func.lower() == sfunc.lower():
+                return True
+        return False
+
+    def find_bootable_partition(self, rawprogram):
+        part = -1
+        for xml in rawprogram:
+            with open(xml, "r") as fl:
+                for evt, elem in ET.iterparse(fl, events=["end"]):
+                    if elem.tag == "program":
+                        label = elem.get("label")
+                        if label in ['xbl', 'xbl_a', 'sbl1']:
+                            if part != -1:
+                                self.error("[FIREHOSE] multiple bootloader found!")
+                                return -1
+                            part = elem.get("physical_partition_number")
+        return part
+
+    def getluns(self, argument):
+        if argument["--lun"] is not None:
+            return [int(argument["--lun"])]
+
+        luns = []
+        if self.cfg.MemoryName.lower() == "ufs":
+            for i in range(0, self.cfg.maxlun):
+                luns.append(i)
+        else:
+            luns = [0]
+        return luns
+
+    def check_param(self, parameters):
+        error = False
+        params = ""
+        for parameter in parameters:
+            params += parameter + " "
+            if parameter not in parameters:
+                error = True
+        if error:
+            if len(parameters) == 1:
+                self.printer("Argument " + params + "required.")
+            else:
+                self.printer("Arguments " + params + "required.")
+            return False
+        return True
+
+    def get_storage_info(self):
+        if "getstorageinfo" in self.firehose.supported_functions:
+            storageinfo = self.firehose.cmd_getstorageinfo()
+            for info in storageinfo:
+                if "storage_info" in info:
+                    rs = info.replace("INFO: ", "")
+                    field = json.loads(rs)
+                    if "storage_info" in field:
+                        info = field["storage_info"]
+                        return info
+        return None
+
+    def handle_firehose(self, cmd, options):
+        if cmd == "gpt":
+            luns = self.getluns(options)
+            directory = options["<directory>"]
+            if directory is None:
+                directory = ""
+            genxml = False
+            if "--genxml" in options:
+                if options["--genxml"]:
+                    genxml = True
+            for lun in luns:
+                sfilename = os.path.join(directory, f"gpt_main{str(lun)}.bin")
+                data, guid_gpt = self.firehose.get_gpt(lun, int(options["--gpt-num-part-entries"]),
+                                                       int(options["--gpt-part-entry-size"]),
+                                                       int(options["--gpt-part-entry-start-lba"]))
+                if guid_gpt is None:
+                    break
+                with open(sfilename, "wb") as write_handle:
+                    write_handle.write(data)
+
+                self.printer(f"Dumped GPT from Lun {str(lun)} to {sfilename}")
+                sfilename = os.path.join(directory, f"gpt_backup{str(lun)}.bin")
+                with open(sfilename, "wb") as write_handle:
+                    write_handle.write(data[self.firehose.cfg.SECTOR_SIZE_IN_BYTES * 2:])
+                self.printer(f"Dumped Backup GPT from Lun {str(lun)} to {sfilename}")
+                if genxml:
+                    guid_gpt.generate_rawprogram(lun, self.firehose.cfg.SECTOR_SIZE_IN_BYTES, directory)
+            return True
+        elif cmd == "printgpt":
+            luns = self.getluns(options)
+            for lun in luns:
+                data, guid_gpt = self.firehose.get_gpt(lun, int(options["--gpt-num-part-entries"]),
+                                                       int(options["--gpt-part-entry-size"]),
+                                                       int(options["--gpt-part-entry-start-lba"]))
+                if guid_gpt is None:
+                    break
+                self.printer(f"\nParsing Lun {str(lun)}:")
+                guid_gpt.print()
+            return True
+        elif cmd == "r":
+            if not self.check_param(["<partitionname>", "<filename>"]):
+                return False
+            partitionname = options["<partitionname>"]
+            filename = options["<filename>"]
+            filenames = filename.split(",")
+            partitions = partitionname.split(",")
+            if len(partitions) != len(filenames):
+                self.error("You need to gives as many filenames as given partitions.")
+                return False
+            i = 0
+            for partition in partitions:
+                if partition=="gpt":
+                    luns = self.getluns(options)
+                    for lun in luns:
+                        partfilename=filenames[i]+".lun%d" % lun
+                        if self.firehose.cmd_read(lun, 0, 32, partfilename):
+                            self.printer(
+                                f"Dumped sector {str(0)} with sector count {str(32)} " +
+                                f"as {partfilename}.")
+                    continue
+                partfilename = filenames[i]
+                i += 1
+                res = self.firehose.detect_partition(options, partition)
+                if res[0]:
+                    lun = res[1]
+                    rpartition = res[2]
+                    if self.firehose.cmd_read(lun, rpartition.sector, rpartition.sectors, partfilename):
+                        self.printer(
+                            f"Dumped sector {str(rpartition.sector)} with sector count {str(rpartition.sectors)} " +
+                            f"as {partfilename}.")
+                else:
+                    fpartitions = res[1]
+                    self.error(f"Error: Couldn't detect partition: {partition}\nAvailable partitions:")
+                    for lun in fpartitions:
+                        for rpartition in fpartitions[lun]:
+                            if self.cfg.MemoryName == "emmc":
+                                self.error("\t" + rpartition)
+                            else:
+                                self.error(lun + ":\t" + rpartition)
+                    return False
+            return True
+        elif cmd == "rl":
+            if not self.check_param(["<directory>"]):
+                return False
+            directory = options["<directory>"]
+            if options["--skip"]:
+                skip = options["--skip"].split(",")
+            else:
+                skip = []
+            genxml = False
+            if "--genxml" in options:
+                if options["--genxml"]:
+                    genxml = True
+            if not os.path.exists(directory):
+                os.mkdir(directory)
+
+            luns = self.getluns(options)
+
+            for lun in luns:
+                data, guid_gpt = self.firehose.get_gpt(lun, int(options["--gpt-num-part-entries"]),
+                                                       int(options["--gpt-part-entry-size"]),
+                                                       int(options["--gpt-part-entry-start-lba"]))
+                if guid_gpt is None:
+                    break
+                if len(luns) > 1:
+                    storedir = os.path.join(directory, "lun" + str(lun))
+                else:
+                    storedir = directory
+                if not os.path.exists(storedir):
+                    os.mkdir(storedir)
+                sfilename = os.path.join(storedir, f"gpt_main{str(lun)}.bin")
+                with open(sfilename, "wb") as write_handle:
+                    write_handle.write(data)
+
+                sfilename = os.path.join(storedir, f"gpt_backup{str(lun)}.bin")
+                with open(sfilename, "wb") as write_handle:
+                    write_handle.write(data[self.firehose.cfg.SECTOR_SIZE_IN_BYTES * 2:])
+
+                if genxml:
+                    guid_gpt.generate_rawprogram(lun, self.firehose.cfg.SECTOR_SIZE_IN_BYTES, storedir)
+
+                for partition in guid_gpt.partentries:
+                    partitionname = partition.name
+                    if partition.name in skip:
+                        continue
+                    filename = os.path.join(storedir, partitionname + ".bin")
+                    self.info(
+                        f"Dumping partition {str(partition.name)} with sector count {str(partition.sectors)} " +
+                        f"as {filename}.")
+                    if self.firehose.cmd_read(lun, partition.sector, partition.sectors, filename):
+                        self.info(f"Dumped partition {str(partition.name)} with sector count " +
+                                  f"{str(partition.sectors)} as {filename}.")
+            return True
+        elif cmd == "rf":
+            if not self.check_param(["<filename>"]):
+                return False
+            filename = options["<filename>"]
+            storageinfo = self.get_storage_info()
+            if storageinfo is not None and self.cfg.MemoryName.lower() in ["spinor" , "nand"]:
+                totalsectors = None
+                if "total_blocks" in storageinfo:
+                    totalsectors = storageinfo["total_blocks"]
+                if "num_physical" in storageinfo:
+                    num_physical = storageinfo["num_physical"]
+                    luns = [0]
+                    if num_physical > 0:
+                        luns=[]
+                        for i in range(num_physical):
+                            luns.append(i)
+                if totalsectors is not None:
+                    for lun in luns:
+                        buffer=self.firehose.cmd_read_buffer(physical_partition_number=lun,
+                                                      start_sector=0, num_partition_sectors=1, display=False)
+                        storageinfo = self.get_storage_info()
+                        if "total_blocks" in storageinfo:
+                            totalsectors = storageinfo["total_blocks"]
+                        if len(luns) > 1:
+                            sfilename = filename + f".lun{str(lun)}"
+                        else:
+                            sfilename = filename
+                        self.printer(f"Dumping sector 0 with sector count {str(totalsectors)} as {filename}.")
+                        if self.firehose.cmd_read(lun, 0, totalsectors, sfilename):
+                            self.printer(
+                                f"Dumped sector 0 with sector count {str(totalsectors)} as {filename}.")
+            else:
+                luns = self.getluns(options)
+                for lun in luns:
+                    data, guid_gpt = self.firehose.get_gpt(lun, int(options["--gpt-num-part-entries"]),
+                                                           int(options["--gpt-part-entry-size"]),
+                                                           int(options["--gpt-part-entry-start-lba"]))
+                    if guid_gpt is None:
+                        break
+                    if len(luns) > 1:
+                        sfilename = filename + f".lun{str(lun)}"
+                    else:
+                        sfilename = filename
+                    self.printer(f"Dumping sector 0 with sector count {str(guid_gpt.totalsectors)} as {filename}.")
+                    if self.firehose.cmd_read(lun, 0, guid_gpt.totalsectors, sfilename):
+                        self.printer(f"Dumped sector 0 with sector count {str(guid_gpt.totalsectors)} as {filename}.")
+                return True
+        elif cmd == "pbl":
+            if not self.check_param(["<filename>"]):
+                return False
+            if not self.check_cmd("peek"):
+                self.error("Peek command isn't supported by edl loader")
+                return False
+            else:
+                filename = options["<filename>"]
+                if self.target_name in infotbl:
+                    target_name = infotbl[self.target_name]
+                    if len(target_name[0]) > 0:
+                        if self.firehose.cmd_peek(target_name[0][0], target_name[0][1], filename, True):
+                            self.printer(f"Dumped pbl at offset {hex(target_name[0][0])} as {filename}.")
+                            return True
+                    else:
+                        self.error("No known pbl offset for this chipset")
+                else:
+                    self.error("Unknown target chipset")
+                self.error("Error on dumping pbl")
+            return False
+        elif cmd == "qfp":
+            if not self.check_param(["<filename>"]):
+                return False
+            if not self.check_cmd("peek"):
+                self.error("Peek command isn't supported by edl loader")
+                return False
+            else:
+                filename = options["<filename>"]
+                if self.target_name not in infotbl:
+                    self.error("Unknown target chipset")
+                else:
+                    target_name = infotbl[self.target_name]
+                    if len(target_name[1]) > 0:
+                        if self.firehose.cmd_peek(target_name[1][0], target_name[1][1], filename):
+                            self.printer(f"Dumped qfprom at offset {hex(target_name[1][0])} as {filename}.")
+                            return True
+                    else:
+                        self.error("No known qfprom offset for this chipset")
+                self.error("Error on dumping qfprom")
+            return False
+        elif cmd == "secureboot":
+            if not self.check_cmd("peek"):
+                self.error("Peek command isn't supported by edl loader")
+                return False
+            else:
+                if self.target_name in secureboottbl:
+                    self.target_name = secureboottbl[self.target_name]
+                    value = unpack("<I", self.firehose.cmd_peek(self.target_name, 4))[0]
+                    is_secure = False
+                    for area in range(0, 4):
+                        sec_boot = (value >> (area * 8)) & 0xFF
+                        pk_hashindex = sec_boot & 3
+                        oem_pkhash = True if ((sec_boot >> 4) & 1) == 1 else False
+                        auth_enabled = True if ((sec_boot >> 5) & 1) == 1 else False
+                        use_serial = True if ((sec_boot >> 6) & 1) == 1 else False
+                        if auth_enabled:
+                            is_secure = True
+                        self.printer(f"Sec_Boot{str(area)} " +
+                                     f"PKHash-Index:{str(pk_hashindex)} " +
+                                     f"OEM_PKHash: {str(oem_pkhash)} " +
+                                     f"Auth_Enabled: {str(auth_enabled)}" +
+                                     f"Use_Serial: {str(use_serial)}")
+                    if is_secure:
+                        self.printer("Secure boot enabled.")
+                    else:
+                        self.printer("Secure boot disabled.")
+                    return True
+                else:
+                    self.error("Unknown target chipset")
+                    return False
+        elif cmd == "memtbl":
+            if not self.check_param(["<filename>"]):
+                return False
+            if not self.check_cmd("peek"):
+                self.error("Peek command isn't supported by edl loader")
+                return False
+            else:
+                filename = options["<filename>"]
+                if self.target_name in infotbl:
+                    self.target_name = infotbl[self.target_name]
+                    if len(self.target_name[2]) > 0:
+                        if self.firehose.cmd_peek(self.target_name[2][0], self.target_name[2][1], filename):
+                            self.printer(f"Dumped memtbl at offset {hex(self.target_name[2][0])} as {filename}.")
+                            return True
+                    else:
+                        self.error("No known memtbl offset for this chipset")
+                else:
+                    self.error("Unknown target chipset")
+                self.error("Error on dumping memtbl")
+            return False
+        elif cmd == "footer":
+            if not self.check_param(["<filename>"]):
+                return False
+            luns = self.getluns(options)
+            filename = options["<filename>"]
+            for lun in luns:
+                data, guid_gpt = self.firehose.get_gpt(lun, int(options["--gpt-num-part-entries"]),
+                                                       int(options["--gpt-part-entry-size"]),
+                                                       int(options["--gpt-part-entry-start-lba"]))
+                if guid_gpt is None:
+                    break
+                pnames = ["userdata2", "metadata", "userdata", "reserved1", "reserved2", "reserved3"]
+                for partition in guid_gpt.partentries:
+                    if partition.name in pnames:
+                        self.printer(f"Detected partition: {partition.name}")
+                        data = self.firehose.cmd_read_buffer(lun,
+                                                             partition.sector +
+                                                             (partition.sectors -
+                                                              (0x4000 // self.firehose.cfg.SECTOR_SIZE_IN_BYTES)),
+                                                             (0x4000 // self.firehose.cfg.SECTOR_SIZE_IN_BYTES), False)
+                        if data == b"":
+                            continue
+                        val = unpack("<I", data[:4])[0]
+                        if (val & 0xFFFFFFF0) == 0xD0B5B1C0:
+                            with open(filename, "wb") as write_handle:
+                                write_handle.write(data)
+                                self.printer(f"Dumped footer from {partition.name} as {filename}.")
+                                return True
+            self.error("Error: Couldn't detect footer partition.")
+            return False
+        elif cmd == "rs":
+            if options["--lun"] is not None:
+                lun = int(options["--lun"])
+            else:
+                lun = 0
+            if not self.check_param(["<filename>", "<sectors>", "<start_sector>"]):
+                return False
+            start = int(options["<start_sector>"])
+            sectors = int(options["<sectors>"])
+            filename = options["<filename>"]
+            if self.firehose.cmd_read(lun, start, sectors, filename, True):
+                self.printer(f"Dumped sector {str(start)} with sector count {str(sectors)} as {filename}.")
+                return True
+        elif cmd == "peek":
+            if not self.check_param(["<offset>", "<length>", "<filename>"]):
+                return False
+            if not self.check_cmd("peek"):
+                self.error("Peek command isn't supported by edl loader")
+                return False
+            else:
+                offset = getint(options["<offset>"])
+                length = getint(options["<length>"])
+                filename = options["<filename>"]
+                self.firehose.cmd_peek(offset, length, filename, True)
+                self.info(
+                    f"Peek data from offset {hex(offset)} and length {hex(length)} was written to {filename}")
+                return True
+        elif cmd == "peekhex":
+            if not self.check_param(["<offset>", "<length>"]):
+                return False
+            if not self.check_cmd("peek"):
+                self.error("Peek command isn't supported by edl loader")
+                return False
+            else:
+                offset = getint(options["<offset>"])
+                length = getint(options["<length>"])
+                resp = self.firehose.cmd_peek(offset, length, "", True)
+                self.printer("\n")
+                self.printer(hexlify(resp))
+                return True
+        elif cmd == "peekqword":
+            if not self.check_param(["<offset>"]):
+                return False
+            if not self.check_cmd("peek"):
+                self.error("Peek command isn't supported by edl loader")
+                return False
+            else:
+                offset = getint(options["<offset>"])
+                resp = self.firehose.cmd_peek(offset, 8, "", True)
+                self.printer("\n")
+                self.printer(hex(unpack("<Q", resp[:8])[0]))
+                return True
+        elif cmd == "peekdword":
+            if not self.check_param(["<offset>"]):
+                return False
+            if not self.check_cmd("peek"):
+                self.error("Peek command isn't supported by edl loader")
+                return False
+            else:
+                offset = getint(options["<offset>"])
+                resp = self.firehose.cmd_peek(offset, 4, "", True)
+                self.printer("\n")
+                self.printer(hex(unpack("<I", resp[:4])[0]))
+                return True
+        elif cmd == "poke":
+            if not self.check_param(["<offset>", "<filename>"]):
+                return False
+            if not self.check_cmd("poke"):
+                self.error("Poke command isn't supported by edl loader")
+                return False
+            else:
+                offset = getint(options["<offset>"])
+                filename = options["<filename>"]
+                return self.firehose.cmd_poke(offset, "", filename, True)
+        elif cmd == "pokehex":
+            if not self.check_param(["<offset>", "<data>"]):
+                return False
+            if not self.check_cmd("poke"):
+                self.error("Poke command isn't supported by edl loader")
+                return False
+            else:
+                offset = getint(options["<offset>"])
+                data = unhexlify(options["<data>"])
+                return self.firehose.cmd_poke(offset, data, "", True)
+        elif cmd == "pokeqword":
+            if not self.check_param(["<offset>", "<data>"]):
+                return False
+            if not self.check_cmd("poke"):
+                self.error("Poke command isn't supported by edl loader")
+                return False
+            else:
+                offset = getint(options["<offset>"])
+                data = pack("<Q", getint(options["<data>"]))
+                return self.firehose.cmd_poke(offset, data, "", True)
+        elif cmd == "pokedword":
+            if not self.check_param(["<offset>", "<data>"]):
+                return False
+            if not self.check_cmd("poke"):
+                self.error("Poke command isn't supported by edl loader")
+                return False
+            else:
+                offset = getint(options["<offset>"])
+                data = pack("<I", getint(options["<data>"]))
+                return self.firehose.cmd_poke(offset, data, "", True)
+        elif cmd == "memcpy":
+            if not self.check_param(["<offset>", "<size>"]):
+                return False
+            if not self.check_cmd("poke"):
+                self.printer("Poke command isn't supported by edl loader")
+            else:
+                srcoffset = getint(options["<offset>"])
+                size = getint(options["<size>"])
+                dstoffset = srcoffset + size
+                if self.firehose.cmd_memcpy(dstoffset, srcoffset, size):
+                    self.printer(f"Memcpy from {hex(srcoffset)} to {hex(dstoffset)} succeeded")
+                    return True
+                else:
+                    return False
+        elif cmd == "reset":
+            return self.firehose.cmd_reset()
+        elif cmd == "nop":
+            if not self.check_cmd("nop"):
+                self.error("Nop command isn't supported by edl loader")
+                return False
+            else:
+                return self.firehose.cmd_nop()
+        elif cmd == "setbootablestoragedrive":
+            if not self.check_param(["<lun>"]):
+                return False
+            if not self.check_cmd("setbootablestoragedrive"):
+                self.error("setbootablestoragedrive command isn't supported by edl loader")
+                return False
+            else:
+                return self.firehose.cmd_setbootablestoragedrive(int(options["<lun>"]))
+        elif cmd == "getstorageinfo":
+            if not self.check_cmd("getstorageinfo"):
+                self.error("getstorageinfo command isn't supported by edl loader")
+                return False
+            else:
+                return self.firehose.cmd_getstorageinfo_string()
+        elif cmd == "w":
+            if not self.check_param(["<partitionname>", "<filename>"]):
+                return False
+            partitionname = options["<partitionname>"]
+            filename = options["<filename>"]
+            if options["--lun"] is not None:
+                lun = int(options["--lun"])
+            else:
+                lun = 0
+            startsector = 0
+            if not os.path.exists(filename):
+                self.error(f"Error: Couldn't find file: {filename}")
+                return False
+            if partitionname.lower() == "gpt":
+                sectors = os.stat(filename).st_size // self.firehose.cfg.SECTOR_SIZE_IN_BYTES
+                res = [True, lun, sectors]
+            else:
+                res = self.firehose.detect_partition(options, partitionname)
+            if res[0]:
+                lun = res[1]
+                sectors = os.stat(filename).st_size // self.firehose.cfg.SECTOR_SIZE_IN_BYTES
+                if (os.stat(filename).st_size % self.firehose.cfg.SECTOR_SIZE_IN_BYTES) > 0:
+                    sectors += 1
+                if partitionname.lower() != "gpt":
+                    partition = res[2]
+                    if sectors > partition.sectors:
+                        self.error(
+                            f"Error: {filename} has {sectors} sectors but partition only has {partition.sectors}.")
+                        return False
+                    startsector = partition.sector
+                if self.firehose.modules is not None:
+                    self.firehose.modules.writeprepare()
+                if self.firehose.cmd_program(lun, startsector, filename):
+                    self.printer(f"Wrote {filename} to sector {str(startsector)}.")
+                    return True
+                else:
+                    self.printer(f"Error writing {filename} to sector {str(startsector)}.")
+                    return False
+            else:
+                if len(res) > 0:
+                    fpartitions = res[1]
+                    self.error(f"Error: Couldn't detect partition: {partitionname}\nAvailable partitions:")
+                    for lun in fpartitions:
+                        for partition in fpartitions[lun]:
+                            if self.cfg.MemoryName == "emmc":
+                                self.error("\t" + partition)
+                            else:
+                                self.error(lun + ":\t" + partition)
+            return False
+        elif cmd == "wl":
+            if not self.check_param(["<directory>"]):
+                return False
+            directory = options["<directory>"]
+            if options["--skip"]:
+                skip = options["--skip"].split(",")
+            else:
+                skip = []
+            luns = self.getluns(options)
+
+            if not os.path.exists(directory):
+                self.error(f"Error: Couldn't find directory: {directory}")
+                sys.exit()
+            filenames = []
+            if self.firehose.modules is not None:
+                self.firehose.modules.writeprepare()
+            for dirName, subdirList, fileList in os.walk(directory):
+                for fname in fileList:
+                    filenames.append(os.path.join(dirName, fname))
+            for lun in luns:
+                data, guid_gpt = self.firehose.get_gpt(lun, int(options["--gpt-num-part-entries"]),
+                                                       int(options["--gpt-part-entry-size"]),
+                                                       int(options["--gpt-part-entry-start-lba"]))
+                if guid_gpt is None:
+                    break
+                if "partentries" in dir(guid_gpt):
+                    for filename in filenames:
+                        for partition in guid_gpt.partentries:
+                            partname = filename[filename.rfind("/") + 1:]
+                            if ".bin" in partname[-4:] or ".img" in partname[-4:] or ".mbn" in partname[-4:]:
+                                partname = partname[:-4]
+                            if partition.name == partname:
+                                if partition.name in skip:
+                                    continue
+                                sectors = os.stat(filename).st_size // self.firehose.cfg.SECTOR_SIZE_IN_BYTES
+                                if (os.stat(filename).st_size % self.firehose.cfg.SECTOR_SIZE_IN_BYTES) > 0:
+                                    sectors += 1
+                                if sectors > partition.sectors:
+                                    self.error(f"Error: {filename} has {sectors} sectors but partition " +
+                                               f"only has {partition.sectors}.")
+                                    return False
+                                self.printer(f"Writing {filename} to partition {str(partition.name)}.")
+                                self.firehose.cmd_program(lun, partition.sector, filename)
+                else:
+                    self.printer("Couldn't write partition. Either wrong memorytype given or no gpt partition.")
+                    return False
+            return True
+        elif cmd == "ws":
+            if not self.check_param(["<start_sector>"]):
+                return False
+            if options["--lun"] is not None:
+                lun = int(options["--lun"])
+            else:
+                lun = 0
+            start = int(options["<start_sector>"])
+            filename = options["<filename>"]
+            if not os.path.exists(filename):
+                self.error(f"Error: Couldn't find file: {filename}")
+                return False
+            if self.firehose.modules is not None:
+                self.firehose.modules.writeprepare()
+            if self.firehose.cmd_program(lun, start, filename):
+                self.printer(f"Wrote {filename} to sector {str(start)}.")
+                return True
+            else:
+                self.error(f"Error on writing {filename} to sector {str(start)}")
+                return False
+        elif cmd == "wf":
+            if not self.check_param(["<filename>"]):
+                return False
+            if options["--lun"] is not None:
+                lun = int(options["--lun"])
+            else:
+                lun = 0
+            start = 0
+            filename = options["<filename>"]
+            if not os.path.exists(filename):
+                self.error(f"Error: Couldn't find file: {filename}")
+                return False
+            if self.firehose.modules is not None:
+                self.firehose.modules.writeprepare()
+            if self.firehose.cmd_program(lun, start, filename):
+                self.printer(f"Wrote {filename} to sector {str(start)}.")
+                return True
+            else:
+                self.error(f"Error on writing {filename} to sector {str(start)}")
+                return False
+        elif cmd == "e":
+            if not self.check_param(["<partitionname>"]):
+                return False
+            luns = self.getluns(options)
+            partitionname = options["<partitionname>"]
+            for lun in luns:
+                data, guid_gpt = self.firehose.get_gpt(lun, int(options["--gpt-num-part-entries"]),
+                                                       int(options["--gpt-part-entry-size"]),
+                                                       int(options["--gpt-part-entry-start-lba"]))
+                if guid_gpt is None:
+                    break
+                if self.firehose.modules is not None:
+                    self.firehose.modules.writeprepare()
+                if "partentries" in dir(guid_gpt):
+                    for partition in guid_gpt.partentries:
+                        if partition.name == partitionname:
+                            self.firehose.cmd_erase(lun, partition.sector, partition.sectors)
+                            self.printer(
+                                f"Erased {partitionname} starting at sector {str(partition.sector)} " +
+                                f"with sector count {str(partition.sectors)}.")
+                            return True
+                else:
+                    self.printer("Couldn't erase partition. Either wrong memorytype given or no gpt partition.")
+                    return False
+            self.error(f"Error: Couldn't detect partition: {partitionname}")
+            return False
+        elif cmd == "ep":
+            if not self.check_param(["<partitionname>", "<sectors>"]):
+                return False
+            luns = self.getluns(options)
+            partitionname = options["<partitionname>"]
+            sectors = int(options["<sectors>"])
+
+            for lun in luns:
+                data, guid_gpt = self.firehose.get_gpt(lun, int(options["--gpt-num-part-entries"]),
+                                                       int(options["--gpt-part-entry-size"]),
+                                                       int(options["--gpt-part-entry-start-lba"]))
+                if guid_gpt is None:
+                    break
+                if self.firehose.modules is not None:
+                    self.firehose.modules.writeprepare()
+                if "partentries" in dir(guid_gpt):
+                    for partition in guid_gpt.partentries:
+                        if partition.name == partitionname:
+                            self.firehose.cmd_erase(lun, partition.sector, sectors)
+                            self.printer(
+                                f"Erased {partitionname} starting at sector {str(partition.sector)} " +
+                                f"with sector count {str(sectors)}.")
+                            return True
+                else:
+                    self.printer("Couldn't erase partition. Either wrong memorytype given or no gpt partition.")
+                    return False
+            self.error(f"Error: Couldn't detect partition: {partitionname}")
+            return False
+        elif cmd == "es":
+            if not self.check_param(["<start_sector>", "<sectors>"]):
+                return False
+            if options["--lun"] is not None:
+                lun = int(options["--lun"])
+            else:
+                lun = 0
+            start = int(options["<start_sector>"])
+            sectors = int(options["<sectors>"])
+            if self.firehose.modules is not None:
+                self.firehose.modules.writeprepare()
+            if self.firehose.cmd_erase(lun, start, sectors):
+                self.printer(f"Erased sector {str(start)} with sector count {str(sectors)}.")
+                return True
+            return False
+        elif cmd == "xml":
+            if not self.check_param(["<xmlfile>"]):
+                return False
+            return self.firehose.cmd_xml(options["<xmlfile>"])
+        elif cmd == "rawxml":
+            if not self.check_param(["<xmlstring>"]):
+                return False
+            return self.firehose.cmd_rawxml(options["<xmlstring>"])
+        elif cmd == "send":
+            if not self.check_param(["<command>"]):
+                return False
+            command = options["<command>"]
+            resp = self.firehose.cmd_send(command, True)
+            self.printer("\n")
+            self.printer(resp)
+            return True
+        elif cmd == "server":
+            return do_tcp_server(self, options, self.handle_firehose)
+        elif cmd == "modules":
+            if not self.check_param(["<command>", "<options>"]):
+                return False
+            mcommand = options["<command>"]
+            moptions = options["<options>"]
+            if self.firehose.modules is None:
+                self.error("Feature is not supported")
+                return False
+            else:
+                return self.firehose.modules.run(command=mcommand, args=moptions)
+        elif cmd == "qfil":
+            self.info("[qfil] raw programming...")
+            rawprogram = options["<rawprogram>"].split(",")
+            imagedir = options["<imagedir>"]
+            patch = options["<patch>"].split(",")
+            for xml in rawprogram:
+                filename = os.path.join(imagedir, xml)
+                if os.path.exists(filename):
+                    self.info("[qfil] programming %s" % xml)
+                    fl = open(filename, "r")
+                    for evt, elem in ET.iterparse(fl, events=["end"]):
+                        if elem.tag == "program":
+                            if elem.get("filename", ""):
+                                filename = os.path.join(imagedir, elem.get("filename"))
+                                if not os.path.isfile(filename):
+                                    self.error("%s doesn't exist!" % filename)
+                                    continue
+                                partition_number = int(elem.get("physical_partition_number"))
+                                num_disk_sectors = self.firehose.getlunsize(partition_number)
+                                start_sector = elem.get("start_sector")
+                                if "NUM_DISK_SECTORS" in start_sector:
+                                    start_sector = start_sector.replace("NUM_DISK_SECTORS", str(num_disk_sectors))
+                                if "-" in start_sector or "*" in start_sector or "/" in start_sector or \
+                                        "+" in start_sector:
+                                    start_sector = start_sector.replace(".", "")
+                                    start_sector = eval(start_sector)
+                                self.info(f"[qfil] programming {filename} to partition({partition_number})" +
+                                          f"@sector({start_sector})...")
+
+                                self.firehose.cmd_program(int(partition_number), int(start_sector), filename)
+                else:
+                    self.warning(f"File : {filename} not found.")
+            self.info("[qfil] raw programming ok.")
+
+            self.info("[qfil] patching...")
+            for xml in patch:
+                filename = os.path.join(imagedir, xml)
+                self.info("[qfil] patching with %s" % xml)
+                if os.path.exists(filename):
+                    fl = open(filename, "r")
+                    for evt, elem in ET.iterparse(fl, events=["end"]):
+                        if elem.tag == "patch":
+                            filename = elem.get("filename")
+                            if filename != "DISK":
+                                continue
+                            start_sector = elem.get("start_sector")
+                            size_in_bytes = elem.get("size_in_bytes")
+                            self.info(
+                                f"[qfil] patching {filename} sector({start_sector}), size={size_in_bytes}".format(
+                                    filename=filename, start_sector=start_sector, size_in_bytes=size_in_bytes))
+                            content = ElementTree.tostring(elem).decode("utf-8")
+                            CMD = "<?xml version=\"1.0\" ?><data>\n {content} </data>".format(
+                                content=content)
+                            print(CMD)
+                            self.firehose.xmlsend(CMD)
+                else:
+                    self.warning(f"File : {filename} not found.")
+            self.info("[qfil] patching ok")
+            bootable = self.find_bootable_partition(rawprogram)
+            if bootable != -1:
+                if self.firehose.cmd_setbootablestoragedrive(bootable):
+                    self.info("[qfil] partition({partition}) is now bootable\n".format(partition=bootable))
+                else:
+                    self.info(
+                        "[qfil] set partition({partition}) as bootable failed\n".format(partition=bootable))
+
+        else:
+            self.error("Unknown/Missing command, a command is required.")
+            return False
+
+==================================================
+FILE: edl/Library/gpt.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2021
+import argparse
+import os
+import sys
+import logging
+from enum import Enum
+from struct import unpack, pack
+from binascii import hexlify
+
+try:
+    from edl.Library.utils import LogBase, structhelper
+except:
+    from utils import LogBase, structhelper
+
+
+class gpt(metaclass=LogBase):
+    class gpt_header:
+        def __init__(self, data):
+            sh = structhelper(data)
+            self.signature = sh.bytes(8)
+            self.revision = sh.dword()
+            self.header_size = sh.dword()
+            self.crc32 = sh.dword()
+            self.reserved = sh.dword()
+            self.current_lba = sh.qword()
+            self.backup_lba = sh.qword()
+            self.first_usable_lba = sh.qword()
+            self.last_usable_lba = sh.qword()
+            self.disk_guid = sh.bytes(16)
+            self.part_entry_start_lba = sh.qword()
+            self.num_part_entries = sh.dword()
+            self.part_entry_size = sh.dword()
+
+    class gpt_partition:
+        def __init__(self, data):
+            sh = structhelper(data)
+            self.type = sh.bytes(16)
+            self.unique = sh.bytes(16)
+            self.first_lba = sh.qword()
+            self.last_lba = sh.qword()
+            self.flags = sh.qword()
+            self.name = sh.string(72)
+
+    class efi_type(Enum):
+        EFI_UNUSED = 0x00000000
+        EFI_MBR = 0x024DEE41
+        EFI_SYSTEM = 0xC12A7328
+        EFI_BIOS_BOOT = 0x21686148
+        EFI_IFFS = 0xD3BFE2DE
+        EFI_SONY_BOOT = 0xF4019732
+        EFI_LENOVO_BOOT = 0xBFBFAFE7
+        EFI_MSR = 0xE3C9E316
+        EFI_BASIC_DATA = 0xEBD0A0A2
+        EFI_LDM_META = 0x5808C8AA
+        EFI_LDM = 0xAF9B60A0
+        EFI_RECOVERY = 0xDE94BBA4
+        EFI_GPFS = 0x37AFFC90
+        EFI_STORAGE_SPACES = 0xE75CAF8F
+        EFI_HPUX_DATA = 0x75894C1E
+        EFI_HPUX_SERVICE = 0xE2A1E728
+        EFI_LINUX_DAYA = 0x0FC63DAF
+        EFI_LINUX_RAID = 0xA19D880F
+        EFI_LINUX_ROOT32 = 0x44479540
+        EFI_LINUX_ROOT64 = 0x4F68BCE3
+        EFI_LINUX_ROOT_ARM32 = 0x69DAD710
+        EFI_LINUX_ROOT_ARM64 = 0xB921B045
+        EFI_LINUX_SWAP = 0x0657FD6D
+        EFI_LINUX_LVM = 0xE6D6D379
+        EFI_LINUX_HOME = 0x933AC7E1
+        EFI_LINUX_SRV = 0x3B8F8425
+        EFI_LINUX_DM_CRYPT = 0x7FFEC5C9
+        EFI_LINUX_LUKS = 0xCA7D7CCB
+        EFI_LINUX_RESERVED = 0x8DA63339
+        EFI_FREEBSD_BOOT = 0x83BD6B9D
+        EFI_FREEBSD_DATA = 0x516E7CB4
+        EFI_FREEBSD_SWAP = 0x516E7CB5
+        EFI_FREEBSD_UFS = 0x516E7CB6
+        EFI_FREEBSD_VINUM = 0x516E7CB8
+        EFI_FREEBSD_ZFS = 0x516E7CBA
+        EFI_OSX_HFS = 0x48465300
+        EFI_OSX_UFS = 0x55465300
+        EFI_OSX_ZFS = 0x6A898CC3
+        EFI_OSX_RAID = 0x52414944
+        EFI_OSX_RAID_OFFLINE = 0x52414944
+        EFI_OSX_RECOVERY = 0x426F6F74
+        EFI_OSX_LABEL = 0x4C616265
+        EFI_OSX_TV_RECOVERY = 0x5265636F
+        EFI_OSX_CORE_STORAGE = 0x53746F72
+        EFI_SOLARIS_BOOT = 0x6A82CB45
+        EFI_SOLARIS_ROOT = 0x6A85CF4D
+        EFI_SOLARIS_SWAP = 0x6A87C46F
+        EFI_SOLARIS_BACKUP = 0x6A8B642B
+        EFI_SOLARIS_USR = 0x6A898CC3
+        EFI_SOLARIS_VAR = 0x6A8EF2E9
+        EFI_SOLARIS_HOME = 0x6A90BA39
+        EFI_SOLARIS_ALTERNATE = 0x6A9283A5
+        EFI_SOLARIS_RESERVED1 = 0x6A945A3B
+        EFI_SOLARIS_RESERVED2 = 0x6A9630D1
+        EFI_SOLARIS_RESERVED3 = 0x6A980767
+        EFI_SOLARIS_RESERVED4 = 0x6A96237F
+        EFI_SOLARIS_RESERVED5 = 0x6A8D2AC7
+        EFI_NETBSD_SWAP = 0x49F48D32
+        EFI_NETBSD_FFS = 0x49F48D5A
+        EFI_NETBSD_LFS = 0x49F48D82
+        EFI_NETBSD_RAID = 0x49F48DAA
+        EFI_NETBSD_CONCAT = 0x2DB519C4
+        EFI_NETBSD_ENCRYPT = 0x2DB519EC
+        EFI_CHROMEOS_KERNEL = 0xFE3A2A5D
+        EFI_CHROMEOS_ROOTFS = 0x3CB8E202
+        EFI_CHROMEOS_FUTURE = 0x2E0A753D
+        EFI_HAIKU = 0x42465331
+        EFI_MIDNIGHTBSD_BOOT = 0x85D5E45E
+        EFI_MIDNIGHTBSD_DATA = 0x85D5E45A
+        EFI_MIDNIGHTBSD_SWAP = 0x85D5E45B
+        EFI_MIDNIGHTBSD_UFS = 0x0394EF8B
+        EFI_MIDNIGHTBSD_VINUM = 0x85D5E45C
+        EFI_MIDNIGHTBSD_ZFS = 0x85D5E45D
+        EFI_CEPH_JOURNAL = 0x45B0969E
+        EFI_CEPH_ENCRYPT = 0x45B0969E
+        EFI_CEPH_OSD = 0x4FBD7E29
+        EFI_CEPH_ENCRYPT_OSD = 0x4FBD7E29
+        EFI_CEPH_CREATE = 0x89C57F98
+        EFI_CEPH_ENCRYPT_CREATE = 0x89C57F98
+        EFI_OPENBSD = 0x824CC7A0
+        EFI_QNX = 0xCEF5A9AD
+        EFI_PLAN9 = 0xC91818F9
+        EFI_VMWARE_VMKCORE = 0x9D275380
+        EFI_VMWARE_VMFS = 0xAA31E02A
+        EFI_VMWARE_RESERVED = 0x9198EFFC
+
+    def __init__(self, num_part_entries=0, part_entry_size=0, part_entry_start_lba=0, loglevel=logging.INFO, *args,
+                 **kwargs):
+        self.num_part_entries = num_part_entries
+        self.__logger = self.__logger
+        self.part_entry_size = part_entry_size
+        self.part_entry_start_lba = part_entry_start_lba
+        self.totalsectors = None
+        self.header = None
+        self.sectorsize = None
+        self.partentries = []
+
+        self.error = self.__logger.error
+        self.__logger.setLevel(loglevel)
+        if loglevel == logging.DEBUG:
+            logfilename = "log.txt"
+            fh = logging.FileHandler(logfilename)
+            self.__logger.addHandler(fh)
+
+    def parseheader(self, gptdata, sectorsize=512):
+        return self.gpt_header(gptdata[sectorsize:sectorsize + 0x5C])
+
+    def parse(self, gptdata, sectorsize=512):
+        self.header = self.gpt_header(gptdata[sectorsize:sectorsize + 0x5C])
+        self.sectorsize = sectorsize
+        if self.header.signature != b"EFI PART":
+            return False
+        if self.header.revision != 0x10000:
+            self.error("Unknown GPT revision.")
+            return False
+        if self.part_entry_start_lba != 0:
+            start = self.part_entry_start_lba
+        else:
+            start = self.header.part_entry_start_lba * sectorsize
+
+        entrysize = self.header.part_entry_size
+        self.partentries = []
+
+        class partf:
+            unique = b""
+            first_lba = 0
+            last_lba = 0
+            flags = 0
+            sector = 0
+            sectors = 0
+            type = b""
+            name = ""
+
+        num_part_entries = self.header.num_part_entries
+
+        for idx in range(0, num_part_entries):
+            data = gptdata[start + (idx * entrysize):start + (idx * entrysize) + entrysize]
+            if int(hexlify(data[16:32]), 16) == 0:
+                break
+            partentry = self.gpt_partition(data)
+            pa = partf()
+            guid1 = unpack("<I", partentry.unique[0:0x4])[0]
+            guid2 = unpack("<H", partentry.unique[0x4:0x6])[0]
+            guid3 = unpack("<H", partentry.unique[0x6:0x8])[0]
+            guid4 = unpack("<H", partentry.unique[0x8:0xA])[0]
+            guid5 = hexlify(partentry.unique[0xA:0x10]).decode('utf-8')
+            pa.unique = "{:08x}-{:04x}-{:04x}-{:04x}-{}".format(guid1, guid2, guid3, guid4, guid5)
+            pa.sector = partentry.first_lba
+            pa.sectors = partentry.last_lba - partentry.first_lba + 1
+            pa.flags = partentry.flags
+            type = int(unpack("<I", partentry.type[0:0x4])[0])
+            try:
+                pa.type = self.efi_type(type).name
+            except:
+                pa.type = hex(type)
+            pa.name = partentry.name.replace(b"\x00\x00", b"").decode('utf-16')
+            if pa.type == "EFI_UNUSED":
+                continue
+            self.partentries.append(pa)
+        self.totalsectors = self.header.last_usable_lba + 34
+        return True
+
+    def print(self):
+        print(self.tostring())
+
+    def tostring(self):
+        mstr = "\nGPT Table:\n-------------\n"
+        for partition in self.partentries:
+            mstr += ("{:20} Offset 0x{:016x}, Length 0x{:016x}, Flags 0x{:08x}, UUID {}, Type {}\n".format(
+                partition.name + ":", partition.sector * self.sectorsize, partition.sectors * self.sectorsize,
+                partition.flags, partition.unique, partition.type))
+        mstr += ("\nTotal disk size:0x{:016x}, sectors:0x{:016x}\n".format(self.totalsectors * self.sectorsize,
+                                                                           self.totalsectors))
+        return mstr
+
+    def generate_rawprogram(self, lun, sectorsize, directory):
+        fname = "rawprogram" + str(lun) + ".xml"
+        with open(os.path.join(directory, fname), "wb") as wf:
+            mstr = "<?xml version=\"1.0\" ?>\n<data>\n"
+            partofsingleimage = "false"
+            readbackverify = "false"
+            sparse = "false"
+            for partition in self.partentries:
+                filename = partition.name + ".bin"
+                mstr += f"\t<program SECTOR_SIZE_IN_BYTES=\"{sectorsize}\" " + \
+                        f"file_sector_offset=\"0\" " \
+                        f"filename=\"{filename}\" " + \
+                        f"label=\"{partition.name}\" " \
+                        f"num_partition_sectors=\"{partition.sectors}\" " + \
+                        f"partofsingleimage=\"{partofsingleimage}\" " \
+                        f"physical_partition_number=\"{str(lun)}\" " + \
+                        f"readbackverify=\"{readbackverify}\" " \
+                        f"size_in_KB=\"{(partition.sectors * sectorsize / 1024):.1f}\" " \
+                        f"sparse=\"{sparse}\" " + \
+                        f"start_byte_hex=\"{hex(partition.sector * sectorsize)}\" " \
+                        f"start_sector=\"{partition.sector}\"/>\n"
+            partofsingleimage = "true"
+            sectors = self.header.first_usable_lba
+            mstr += f"\t<program SECTOR_SIZE_IN_BYTES=\"{sectorsize}\" " + \
+                    f"file_sector_offset=\"0\" " + \
+                    f"filename=\"gpt_main{str(lun)}.bin\" " + \
+                    f"label=\"PrimaryGPT\" " + \
+                    f"num_partition_sectors=\"{sectors}\" " + \
+                    f"partofsingleimage=\"{partofsingleimage}\" " + \
+                    f"physical_partition_number=\"{str(lun)}\" " + \
+                    f"readbackverify=\"{readbackverify}\" " + \
+                    f"size_in_KB=\"{(sectors * sectorsize / 1024):.1f}\" " + \
+                    f"sparse=\"{sparse}\" " + \
+                    f"start_byte_hex=\"0x0\" " + \
+                    f"start_sector=\"0\"/>\n"
+            sectors = self.header.first_usable_lba - 1
+            mstr += f"\t<program SECTOR_SIZE_IN_BYTES=\"{sectorsize}\" " + \
+                    f"file_sector_offset=\"0\" " + \
+                    f"filename=\"gpt_backup{str(lun)}.bin\" " + \
+                    f"label=\"BackupGPT\" " + \
+                    f"num_partition_sectors=\"{sectors}\" " + \
+                    f"partofsingleimage=\"{partofsingleimage}\" " + \
+                    f"physical_partition_number=\"{str(lun)}\" " + \
+                    f"readbackverify=\"{readbackverify}\" " + \
+                    f"size_in_KB=\"{(sectors * sectorsize / 1024):.1f}\" " + \
+                    f"sparse=\"{sparse}\" " + \
+                    f"start_byte_hex=\"({sectorsize}*NUM_DISK_SECTORS)-{sectorsize * sectors}.\" " + \
+                    f"start_sector=\"NUM_DISK_SECTORS-{sectors}.\"/>\n"
+            mstr += "</data>"
+            wf.write(bytes(mstr, 'utf-8'))
+            print(f"Wrote partition xml as {fname}")
+
+    def print_gptfile(self, filename):
+        try:
+            filesize = os.stat(filename).st_size
+            with open(filename, "rb") as rf:
+                size = min(32 * 4096, filesize)
+                data = rf.read(size)
+                for sectorsize in [512, 4096]:
+                    result = self.parse(data, sectorsize)
+                    if result:
+                        break
+                if result:
+                    print(self.tostring())
+                return result
+        except Exception as e:
+            self.error(str(e))
+        return ""
+
+    def test_gpt(self):
+        res = self.print_gptfile(os.path.join("TestFiles", "gpt_sm8180x.bin"))
+        assert res, "GPT Partition wasn't decoded properly"
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="GPT utils")
+    subparsers = parser.add_subparsers(dest="command", help='sub-command help')
+
+    parser_print = subparsers.add_parser("print", help="Print the gpt table")
+    parser_print.add_argument("image", help="The path of the GPT disk image")
+
+    parser_test = subparsers.add_parser("test", help="Run self-test")
+
+    parser_extract = subparsers.add_parser("extract", help="Extract the partitions")
+    parser_extract.add_argument("image", help="The path of the GPT disk image")
+    parser_extract.add_argument("-out", "-o", help="The path to extract the partitions")
+    parser_extract.add_argument("-partition", "-p", help="Extract specific partitions (separated by comma)")
+
+    args = parser.parse_args()
+    if args.command not in ["print", "extract", "test"]:
+        parser.error("Command is mandatory")
+
+    gp = gpt()
+    if args.command == "print":
+        if not os.path.exists(args.image):
+            print(f"File {args.image} does not exist. Aborting.")
+            sys.exit(1)
+        gp.print_gptfile(args.image)
+    elif args.command == "test":
+        gp.test_gpt()
+    elif args.command == "extract":
+        if not os.path.exists(args.image):
+            print(f"File {args.image} does not exist. Aborting.")
+            sys.exit(1)
+        filesize = os.stat(args.image).st_size
+        with open(args.image, "rb", buffering=1024 * 1024) as rf:
+            data = rf.read(min(32 * 4096, filesize))
+            ssize = None
+            for sectorsize in [512, 4096]:
+                result = gp.parse(data, sectorsize)
+                if result:
+                    ssize = sectorsize
+                    break
+            if ssize is not None:
+                for partition in gp.partentries:
+                    if args.partition is not None:
+                        if partition != args.partition:
+                            continue
+                    name = partition.name
+                    start = partition.sector * ssize
+                    length = partition.sectors * ssize
+                    out = args.out
+                    if out is None:
+                        out = "."
+                    if not os.path.exists(out):
+                        os.makedirs(out)
+                    filename = os.path.join(out, name)
+                    rf.seek(start)
+                    bytestoread = length
+                    with open(filename, "wb", buffering=1024 * 1024) as wf:
+                        while bytestoread > 0:
+                            size = min(bytestoread, 0x200000)
+                            rf.read(size)
+                            wf.write(size)
+                            bytestoread -= size
+                    print(f"Extracting {name} to {filename} at {hex(start)}, length {hex(length)}")
+
+
+==================================================
+FILE: edl/Library/hdlc.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2019
+
+import logging
+from binascii import hexlify
+from struct import unpack
+import time
+
+MAX_PACKET_LEN = 4096
+
+crcTbl = (
+    0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf,
+    0x8c48, 0x9dc1, 0xaf5a, 0xbed3, 0xca6c, 0xdbe5, 0xe97e, 0xf8f7,
+    0x1081, 0x0108, 0x3393, 0x221a, 0x56a5, 0x472c, 0x75b7, 0x643e,
+    0x9cc9, 0x8d40, 0xbfdb, 0xae52, 0xdaed, 0xcb64, 0xf9ff, 0xe876,
+    0x2102, 0x308b, 0x0210, 0x1399, 0x6726, 0x76af, 0x4434, 0x55bd,
+    0xad4a, 0xbcc3, 0x8e58, 0x9fd1, 0xeb6e, 0xfae7, 0xc87c, 0xd9f5,
+    0x3183, 0x200a, 0x1291, 0x0318, 0x77a7, 0x662e, 0x54b5, 0x453c,
+    0xbdcb, 0xac42, 0x9ed9, 0x8f50, 0xfbef, 0xea66, 0xd8fd, 0xc974,
+    0x4204, 0x538d, 0x6116, 0x709f, 0x0420, 0x15a9, 0x2732, 0x36bb,
+    0xce4c, 0xdfc5, 0xed5e, 0xfcd7, 0x8868, 0x99e1, 0xab7a, 0xbaf3,
+    0x5285, 0x430c, 0x7197, 0x601e, 0x14a1, 0x0528, 0x37b3, 0x263a,
+    0xdecd, 0xcf44, 0xfddf, 0xec56, 0x98e9, 0x8960, 0xbbfb, 0xaa72,
+    0x6306, 0x728f, 0x4014, 0x519d, 0x2522, 0x34ab, 0x0630, 0x17b9,
+    0xef4e, 0xfec7, 0xcc5c, 0xddd5, 0xa96a, 0xb8e3, 0x8a78, 0x9bf1,
+    0x7387, 0x620e, 0x5095, 0x411c, 0x35a3, 0x242a, 0x16b1, 0x0738,
+    0xffcf, 0xee46, 0xdcdd, 0xcd54, 0xb9eb, 0xa862, 0x9af9, 0x8b70,
+    0x8408, 0x9581, 0xa71a, 0xb693, 0xc22c, 0xd3a5, 0xe13e, 0xf0b7,
+    0x0840, 0x19c9, 0x2b52, 0x3adb, 0x4e64, 0x5fed, 0x6d76, 0x7cff,
+    0x9489, 0x8500, 0xb79b, 0xa612, 0xd2ad, 0xc324, 0xf1bf, 0xe036,
+    0x18c1, 0x0948, 0x3bd3, 0x2a5a, 0x5ee5, 0x4f6c, 0x7df7, 0x6c7e,
+    0xa50a, 0xb483, 0x8618, 0x9791, 0xe32e, 0xf2a7, 0xc03c, 0xd1b5,
+    0x2942, 0x38cb, 0x0a50, 0x1bd9, 0x6f66, 0x7eef, 0x4c74, 0x5dfd,
+    0xb58b, 0xa402, 0x9699, 0x8710, 0xf3af, 0xe226, 0xd0bd, 0xc134,
+    0x39c3, 0x284a, 0x1ad1, 0x0b58, 0x7fe7, 0x6e6e, 0x5cf5, 0x4d7c,
+    0xc60c, 0xd785, 0xe51e, 0xf497, 0x8028, 0x91a1, 0xa33a, 0xb2b3,
+    0x4a44, 0x5bcd, 0x6956, 0x78df, 0x0c60, 0x1de9, 0x2f72, 0x3efb,
+    0xd68d, 0xc704, 0xf59f, 0xe416, 0x90a9, 0x8120, 0xb3bb, 0xa232,
+    0x5ac5, 0x4b4c, 0x79d7, 0x685e, 0x1ce1, 0x0d68, 0x3ff3, 0x2e7a,
+    0xe70e, 0xf687, 0xc41c, 0xd595, 0xa12a, 0xb0a3, 0x8238, 0x93b1,
+    0x6b46, 0x7acf, 0x4854, 0x59dd, 0x2d62, 0x3ceb, 0x0e70, 0x1ff9,
+    0xf78f, 0xe606, 0xd49d, 0xc514, 0xb1ab, 0xa022, 0x92b9, 0x8330,
+    0x7bc7, 0x6a4e, 0x58d5, 0x495c, 0x3de3, 0x2c6a, 0x1ef1, 0x0f78)
+
+
+def serial16le(data):
+    out = bytearray()
+    out.append(data & 0xFF)
+    out.append((data >> 8) & 0xFF)
+    return out
+
+
+def serial16(data):
+    out = bytearray()
+    out.append((data >> 8) & 0xFF)
+    out.append(data & 0xFF)
+    return out
+
+
+def serial32le(data):
+    out = bytearray()
+    out += serial16le(data & 0xFFFF)
+    out += serial16le((data >> 16) & 0xFFFF)
+    return out
+
+
+def crc16(iv, data):
+    for byte in data:
+        iv = ((iv >> 8) & 0xFFFF) ^ crcTbl[(iv ^ byte) & 0xFF]
+    return ~iv & 0xFFFF
+
+
+def serial32(data):
+    out = bytearray()
+    out += serial16((data >> 16) & 0xFFFF)
+    out += serial16(data & 0xFFFF)
+    return out
+
+
+def escape(indata):
+    outdata = bytearray()
+    for i in range(0, len(indata)):
+        buf = indata[i]
+        if buf == 0x7e:
+            outdata.append(0x7d)
+            outdata.append(0x5e)
+        elif buf == 0x7d:
+            outdata.append(0x7d)
+            outdata.append(0x5d)
+        else:
+            outdata.append(buf)
+    return outdata
+
+
+def unescape(indata):
+    mescape = False
+    out = bytearray()
+    for buf in indata:
+        if mescape:
+            if buf == 0x5e:
+                out.append(0x7e)
+            elif buf == 0x5d:
+                out.append(0x7d)
+            else:
+                logging.error("Fatal error unescaping buffer!")
+                return None
+            mescape = False
+        else:
+            if buf == 0x7d:
+                mescape = True
+            else:
+                out.append(buf)
+    if len(out) == 0:
+        return None
+    return out
+
+
+def convert_cmdbuf(indata):
+    crc16val = crc16(0xFFFF, indata)
+    indata.extend(bytearray(serial16le(crc16val)))
+    outdata = escape(indata)
+    outdata.append(0x7E)
+    return outdata
+
+
+class hdlc:
+    def __init__(self, cdc):
+        self.cdc = cdc
+        self.programmer = None
+        self.timeout = 1500
+
+    def receive_reply(self, timeout=None):
+        replybuf = bytearray()
+        if timeout is None:
+            timeout = self.timeout
+        tmp = self.cdc.read(MAX_PACKET_LEN, timeout)
+        if tmp == bytearray():
+            return 0
+        if tmp == b"":
+            return 0
+        retry = 0
+        while tmp[-1] != 0x7E:
+            time.sleep(0.01)
+            tmp += self.cdc.read(MAX_PACKET_LEN, timeout)
+            retry += 1
+            if retry > 5:
+                break
+        replybuf.extend(tmp)
+        data = unescape(replybuf)
+        # print(hexlify(data))
+        if len(data) > 3:
+            crc16val = crc16(0xFFFF, data[:-3])
+            reccrc = int(data[-3]) + (int(data[-2]) << 8)
+            if crc16val != reccrc:
+                return -1
+        else:
+            time.sleep(0.01)
+            data = self.cdc.read(MAX_PACKET_LEN, timeout)
+            if len(data) > 3:
+                crc16val = crc16(0xFFFF, data[:-3])
+                reccrc = int(data[-3]) + (int(data[-2]) << 8)
+                if crc16val != reccrc:
+                    return -1
+                return data
+        return data[:-3]
+
+    def receive_reply_nocrc(self, timeout=None):
+        replybuf = bytearray()
+        if timeout is None:
+            timeout = self.timeout
+        tmp = self.cdc.read(MAX_PACKET_LEN, timeout)
+        if tmp == bytearray():
+            return 0
+        if tmp == b"":
+            return 0
+        retry = 0
+        while tmp[-1] != 0x7E:
+            # time.sleep(0.05)
+            tmp += self.cdc.read(MAX_PACKET_LEN, timeout)
+            retry += 1
+            if retry > 5:
+                break
+        replybuf.extend(tmp)
+        data = unescape(replybuf)
+        # print(hexlify(data))
+        if len(data) > 3:
+            # crc16val = self.crc16(0xFFFF, data[:-3])
+            # reccrc = int(data[-3]) + (int(data[-2]) << 8)
+            return data[:-3]
+        else:
+            time.sleep(0.5)
+            data = self.cdc.read(MAX_PACKET_LEN, timeout)
+            if len(data) > 3:
+                # crc16val = self.crc16(0xFFFF, data[:-3])
+                # reccrc = int(data[-3]) + (int(data[-2]) << 8)
+                return data[:-3]
+            else:
+                return data
+
+    def send_unframed_buf(self, outdata, prefixflag):
+        # ttyflush()
+        if prefixflag:
+            tmp = bytearray()
+            tmp.append(0x7E)
+            tmp.extend(outdata)
+            outdata = tmp
+        return self.cdc.write(outdata[:MAX_PACKET_LEN])
+        # FlushFileBuffers(ser)
+
+    def send_cmd_base(self, outdata, prefixflag, nocrc=False):
+        if isinstance(outdata, str):
+            outdata = bytes(outdata, 'utf-8')
+        packet = convert_cmdbuf(bytearray(outdata))
+        if self.send_unframed_buf(packet, prefixflag):
+            if nocrc:
+                return self.receive_reply_nocrc()
+            else:
+                return self.receive_reply()
+        return b""
+
+    def send_cmd(self, outdata, nocrc=False):
+        return self.send_cmd_base(outdata, 1, nocrc)
+
+    def send_cmd_np(self, outdata, nocrc=False):
+        return self.send_cmd_base(outdata, 0, nocrc)
+
+    def show_errpacket(self, descr, pktbuf):
+        if len(pktbuf) == 0:
+            return
+        logging.error("Error: %s " % descr)
+
+        if pktbuf[1] == 0x0e:
+            pktbuf[-4] = 0
+            # puts(pktbuf+2)
+            ret = self.receive_reply()
+            errorcode = unpack("<I", ret[2:2 + 4])
+            logging.error("Error code = %08x\n\n", errorcode)
+        else:
+            print(hexlify(pktbuf))
+
+
+==================================================
+FILE: edl/Library/memparse.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2021
+
+import os
+import pt64
+import pt
+import argparse
+
+
+def pt64_walk(data, ttbr, tnsz, levels=3):
+    print("Dumping page tables (levels=%d)" % levels)
+    print("First level (ptbase = %016x)" % ttbr)
+    print("---------------------------------------------")
+    fl = data[ttbr - ttbr:ttbr - ttbr + 0x1000]
+
+    if levels <= 1:
+        return
+
+    for (va, fle) in pt64.parse_pt(fl, 0, tnsz, 1):
+        if "TABLE" in str(fle):
+            print("Second level (ptbase = %016x)" % fle.output)
+            print("---------------------------------------------")
+
+            sl = data[fle.output - ttbr:fle.output - ttbr + 0x4000]
+            sl = pt64.parse_pt(sl, va, tnsz, 2)
+
+            if levels <= 2:
+                continue
+
+            for (mva, sle) in sl:
+                if "TABLE" in str(sle):
+                    print("Third level (ptbase = %016x)" % sle.output)
+                    print("---------------------------------------------")
+                    tl = data[sle.output - ttbr:sle.output - ttbr + 0x1000]
+                    pt64.parse_pt(tl, mva, tnsz, 3)
+
+
+def pt32_walk(data, ttbr, skip):
+    print("First level (va = %08x)" % ttbr)
+    print("---------------------------------------------")
+    fl = data[ttbr - ttbr:ttbr - ttbr + 0x4000]
+
+    i = 0
+    for (va, fl) in pt.parse_pt(fl):
+        i += 1
+        if i <= skip:
+            continue
+        if type(fl) == pt.pt_desc:
+            print("")
+            print("Second level (va = %08x)" % va)
+            print("---------------------------------------------")
+            sldata = data[fl.coarse_base - ttbr:fl.coarse_base - ttbr + 0x400]
+            pt.parse_spt(sldata, va)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="memparse",
+        usage="python memparse.py -arch <32,64> -in <filename> -mem <offset>",
+        formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument('-in', '--in', dest='infile', help='memory dump', default="")
+    parser.add_argument('-arch', '--arch', dest='arch', help='architecture=32,64', default="32")
+    parser.add_argument('-mem', '--mem', dest='mem', help='memoryoffset', default="0x200000")
+    args = parser.parse_args()
+    if args.infile == "":
+        print("You need to add an -in [memorydump filename]")
+        return
+
+    with open(args.infile, "rb") as rf:
+        data = rf.read()
+        if args.arch == "32":
+            pt32_walk(data, int(args.mem, 16), False)
+        else:
+            pt64_walk(data, int(args.mem, 16), 0, 3)
+
+
+main()
+
+
+==================================================
+FILE: edl/Library/nand_config.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2019
+import ctypes
+from enum import Enum
+from edl.Config.qualcomm_config import secgen, secureboottbl
+
+c_uint8 = ctypes.c_uint8
+
+# nandbase MSM_NAND_BASE
+# qfprom SECURITY_CONTROL_BASE_PHYS
+config_tbl = {
+    #           bam nandbase bcraddr    secureboot          pbl                   qfprom                memtbl
+    3: ["9x25", 1, 0xf9af0000, 0xfc401a40, secureboottbl["MDM9x25"], secgen[2][0], secgen[2][1], secgen[2][2]],
+    8: ["9x35", 1, 0xf9af0000, 0xfc401a40, secureboottbl["MDM9x35"], secgen[2][0], secgen[2][1], secgen[2][2]],
+    10: ["9x45", 1, 0x79B0000, 0x183f000, secureboottbl["MDM9x45"], secgen[2][0], secgen[2][1], secgen[2][2]],
+    16: ["9x55", 0, 0x79B0000, 0x183f000, secureboottbl["MDM9x45"], secgen[5][0], secgen[5][1], secgen[5][2]],
+    17: ["9x60", 0, 0x79B0000, 0x183f000, secureboottbl["MDM9x60"], secgen[5][0], secgen[5][1], secgen[5][2]],
+    12: ["9x07", 0, 0x79B0000, 0x183f000, secureboottbl["MDM9607"], secgen[5][0], secgen[5][1], secgen[5][2]]
+}
+
+supported_flash = {
+    # Flash ID   Density(MB)  Wid Pgsz  Blksz        oobsz onenand   Manuf */
+    0x2690ac2c: [(512 << 20), 0, 4096, (4096 << 6), 224, 0],  # QUECTEL_NAND_FM6BD4G2GXA
+    0x2690ac98: [(512 << 20), 0, 4096, (4096 << 6), 256, 0],  # QUECTEL_NAND_NM14FSK2LAXCL
+    0x1500aa98: [(256 << 20), 0, 2048, (2048 << 6), 64, 0],
+    0x5500ba98: [(256 << 20), 1, 2048, (2048 << 6), 64, 0],
+    0xd580b12c: [(256 << 20), 1, 2048, (2048 << 6), 64, 0],
+    0x5590bc2c: [(512 << 20), 1, 2048, (2048 << 6), 64, 0],
+    0x1580aa2c: [(256 << 20), 0, 2048, (2048 << 6), 64, 0],
+    0x1590aa2c: [(256 << 20), 0, 2048, (2048 << 6), 64, 0],
+    0x1590ac2c: [(512 << 20), 0, 2048, (2048 << 6), 64, 0],
+    0x5580baad: [(256 << 20), 1, 2048, (2048 << 6), 64, 0],
+    0x5510baad: [(256 << 20), 1, 2048, (2048 << 6), 64, 0],
+    # 0x004000ec: [(256 << 20), 0, 2048, (2048 << 6), 64, 1],
+    # 0x005c00ec: [(256 << 20), 0, 2048, (2048 << 6), 64, 1],
+    # 0x005800ec: [(256 << 20), 0, 2048, (2048 << 6), 64, 1],
+    0x5580ba2c: [(256 << 20), 1, 2048, (2048 << 6), 64, 0],
+    0x6600b3ec: [(1024 << 20), 1, 4096, (4096 << 6), 128, 0],
+    0x55d1b32c: [(1024 << 20), 1, 2048, (2048 << 6), 64, 0]
+    # 0x1500aaec: 0xFF00FFFF, (256 << 20), 0, 2048, (2048 << 6), 64, 0],
+    # 0x5500baec: 0xFF00FFFF, (256 << 20), 1, 2048, (2048 << 6), 64, 0},	/*Sams */
+    # 0x6600bcec: 0xFF00FFFF, (512 << 20), 1, 4096, (4096 << 6), 128, 0},	/*Sams */
+    # 0x2600482c: 0xFF00FFFF, (2048 << 20), 0, 4096, (4096 << 7), 224, 0},	/*8bit bch ecc */
+}
+
+
+class BadFlags(Enum):
+    BAD_UNDEF = 0
+    BAD_FILL = 1
+    BAD_SKIP = 2
+    BAD_IGNORE = 3
+    BAD_DISABLE = 4
+
+
+nand_ids = [
+    ("NAND 16MiB 1,8V 8-bit", 0x33, 16),
+    ("NAND 16MiB 3,3V 8-bit", 0x73, 16),
+    ("NAND 16MiB 1,8V 16-bit", 0x43, 16),
+    ("NAND 16MiB 3,3V 16-bit", 0x53, 16),
+
+    ("NAND 32MiB 1,8V 8-bit", 0x35, 32),
+    ("NAND 32MiB 3,3V 8-bit", 0x75, 32),
+    ("NAND 32MiB 1,8V 16-bit", 0x45, 32),
+    ("NAND 32MiB 3,3V 16-bit", 0x55, 32),
+
+    ("NAND 64MiB 1,8V 8-bit", 0x36, 64),
+    ("NAND 64MiB 3,3V 8-bit", 0x76, 64),
+    ("NAND 64MiB 1,8V 16-bit", 0x46, 64),
+    ("NAND 64MiB 3,3V 16-bit", 0x56, 64),
+
+    ("NAND 128MiB 1,8V 8-bit", 0x78, 128),
+    ("NAND 128MiB 1,8V 8-bit", 0x39, 128),
+    ("NAND 128MiB 3,3V 8-bit", 0x79, 128),
+    ("NAND 128MiB 1,8V 16-bit", 0x72, 128),
+    ("NAND 128MiB 1,8V 16-bit", 0x49, 128),
+    ("NAND 128MiB 3,3V 16-bit", 0x74, 128),
+    ("NAND 128MiB 3,3V 16-bit", 0x59, 128),
+    ("NAND 256MiB 3,3V 8-bit", 0x71, 256),
+
+    # 512 Megabit
+    ("NAND 64MiB 1,8V 8-bit", 0xA2, 64),
+    ("NAND 64MiB 1,8V 8-bit", 0xA0, 64),
+    ("NAND 64MiB 3,3V 8-bit", 0xF2, 64),
+    ("NAND 64MiB 3,3V 8-bit", 0xD0, 64),
+    ("NAND 64MiB 1,8V 16-bit", 0xB2, 64),
+    ("NAND 64MiB 1,8V 16-bit", 0xB0, 64),
+    ("NAND 64MiB 3,3V 16-bit", 0xC2, 64),
+    ("NAND 64MiB 3,3V 16-bit", 0xC0, 64),
+
+    # 1 Gigabit
+    ("NAND 128MiB 1,8V 8-bit", 0xA1, 128),
+    ("NAND 128MiB 3,3V 8-bit", 0xF1, 128),
+    ("NAND 128MiB 3,3V 8-bit", 0xD1, 128),
+    ("NAND 128MiB 1,8V 16-bit", 0xB1, 128),
+    ("NAND 128MiB 3,3V 16-bit", 0xC1, 128),
+    ("NAND 128MiB 1,8V 16-bit", 0xAD, 128),
+
+    # 2 Gigabit
+    ("NAND 256MiB 1.8V 8-bit", 0xAA, 256),
+    ("NAND 256MiB 3.3V 8-bit", 0xDA, 256),
+    ("NAND 256MiB 1.8V 16-bit", 0xBA, 256),
+    ("NAND 256MiB 3.3V 16-bit", 0xCA, 256),
+
+    # 4 Gigabit
+    ("NAND 512MiB 1.8V 8-bit", 0xAC, 512),
+    ("NAND 512MiB 3.3V 8-bit", 0xDC, 512),
+    ("NAND 512MiB 1.8V 16-bit", 0xBC, 512),
+    ("NAND 512MiB 3.3V 16-bit", 0xCC, 512),
+
+    # 8 Gigabit
+    ("NAND 1GiB 1.8V 8-bit", 0xA3, 1024),
+    ("NAND 1GiB 3.3V 8-bit", 0xD3, 1024),
+    ("NAND 1GiB 1.8V 16-bit", 0xB3, 1024),
+    ("NAND 1GiB 3.3V 16-bit", 0xC3, 1024),
+
+    # 16 Gigabit
+    ("NAND 2GiB 1.8V 8-bit", 0xA5, 2048),
+    ("NAND 2GiB 3.3V 8-bit", 0xD5, 2048),
+    ("NAND 2GiB 1.8V 16-bit", 0xB5, 2048),
+    ("NAND 2GiB 3.3V 16-bit", 0xC5, 2048),
+
+    # 32 Gigabit
+    ("NAND 4GiB 1.8V 8-bit", 0xA7, 4096),
+    ("NAND 4GiB 3.3V 8-bit", 0xD7, 4096),
+    ("NAND 4GiB 1.8V 16-bit", 0xB7, 4096),
+    ("NAND 4GiB 3.3V 16-bit", 0xC7, 4096),
+
+    # 64 Gigabit
+    ("NAND 8GiB 1.8V 8-bit", 0xAE, 8192),
+    ("NAND 8GiB 3.3V 8-bit", 0xDE, 8192),
+    ("NAND 8GiB 1.8V 16-bit", 0xBE, 8192),
+    ("NAND 8GiB 3.3V 16-bit", 0xCE, 8192),
+
+    # 128 Gigabit
+    ("NAND 16GiB 1.8V 8-bit", 0x1A, 16384),
+    ("NAND 16GiB 3.3V 8-bit", 0x3A, 16384),
+    ("NAND 16GiB 1.8V 16-bit", 0x2A, 16384),
+    ("NAND 16GiB 3.3V 16-bit", 0x4A, 16384),
+
+    # 256 Gigabit
+    ("NAND 32GiB 1.8V 8-bit", 0x1C, 32768),
+    ("NAND 32GiB 3.3V 8-bit", 0x3C, 32768),
+    ("NAND 32GiB 1.8V 16-bit", 0x2C, 32768),
+    ("NAND 32GiB 3.3V 16-bit", 0x4C, 32768),
+
+    # 512 Gigabit
+    ("NAND 64GiB 1.8V 8-bit", 0x1E, 65536),
+    ("NAND 64GiB 3.3V 8-bit", 0x3E, 65536),
+    ("NAND 64GiB 1.8V 16-bit", 0x2E, 65536),
+    ("NAND 64GiB 3.3V 16-bit", 0x4E, 65536),
+    (0, 0, 0),
+]
+
+nand_manuf_ids = [
+    (0x98, "Toshiba"),
+    (0xec, "Samsung"),
+    (0x04, "Fujitsu"),
+    (0x8f, "National"),
+    (0x07, "Renesas"),
+    (0x20, "ST Micro"),
+    (0xad, "Hynix"),
+    (0x2c, "Micron"),
+    (0xc8, "Elite Semiconductor"),
+    (0x01, "Spansion/AMD"),
+    (0xef, "Winbond"),
+    (0x0, "")
+]
+
+toshiba_tbl = {
+    # small_slc,device_width,density_mbits
+    0x36: [True, 8, 512],
+    0x46: [True, 16, 512],
+    0x79: [True, 8, 1024],
+    0xA0: [False, -1, 512],
+    0xB0: [False, -1, 512],
+    0xC0: [False, -1, 512],
+    0xD0: [False, -1, 512],
+    0xA1: [False, -1, 1024],
+    0xB1: [False, -1, 1024],
+    0xC1: [False, -1, 1024],
+    0xD1: [False, -1, 1024],
+    0xAA: [False, -1, 2048],
+    0xBA: [False, -1, 2048],
+    0xCA: [False, -1, 2048],
+    0xDA: [False, -1, 2048],
+    0xAC: [False, -1, 4096],
+    0xBC: [False, -1, 4096],
+    0xCC: [False, -1, 4096],
+    0xDC: [False, -1, 4096],
+    0xA3: [False, -1, 8192],
+    0xB3: [False, -1, 8192],
+    0xC3: [False, -1, 8192],
+    0xD3: [False, -1, 8192],
+    0xA5: [False, -1, 16384],
+    0xB5: [False, -1, 16384],
+    0xC5: [False, -1, 16384],
+    0xD5: [False, -1, 16384],
+}
+
+samsung_tbl = {
+    # small_slc,device_width,density_mbits
+    0x45: [True, 16, 256],
+    0x55: [True, 16, 256],
+    0x35: [True, 8, 256],
+    0x75: [True, 8, 256],
+    0x46: [True, 16, 512],
+    0x56: [True, 16, 512],
+    0x76: [True, 8, 512],
+    0x36: [True, 8, 512],
+    0x72: [True, 16, 1024],
+    0x74: [True, 16, 1024],
+    0x79: [True, 8, 1024],
+    0x78: [True, 8, 1024],
+    0x71: [True, 8, 2048],
+    0xDC: [True, 8, 4096],
+    0xA1: [False, -1, 1024],
+    0xB1: [False, -1, 1024],
+    0xC1: [False, -1, 1024],
+    0xD1: [False, -1, 1024],
+    0xAA: [False, -1, 2048],
+    0xBA: [False, -1, 2048],
+    0xCA: [False, -1, 2048],
+    0xDA: [False, -1, 2048],
+    0xAC: [False, -1, 4096],
+    0xBC: [False, -1, 4096],
+    0xCC: [False, -1, 4096],
+    0xA3: [False, -1, 8192],
+    0xB3: [False, -1, 8192],
+    0xC3: [False, -1, 8192],
+    0xD3: [False, -1, 8192],
+    0xA5: [False, -1, 16384],
+    0xB5: [False, -1, 16384],
+    0xC5: [False, -1, 16384],
+    0xD5: [False, -1, 16384]
+}
+
+
+class SettingsOpt:
+    def __init__(self, parent, chipset):
+        self.PAGESIZE = 4096
+        self.parent = parent
+        self.bad_loader = 0
+        self.sectors_per_page = 0
+        self.sectorsize = 512
+        self.flash_mfr = ""
+        self.flash_descr = ""
+        self.IsWideFlash = 0
+        self.badsector = 0
+        self.badflag = 0
+        self.badposition = 0
+        self.badplace = 0
+        self.bch_mode = 0
+        self.ecc_size = 0
+        self.ecc_bit = 0
+        self.num_pages_per_blk = 64
+        self.udflag = 0
+        self.sahara = 1
+        self.args_disable_ecc = 0  # 0=enable, 1=disable
+        self.bad_processing_flag = BadFlags.BAD_SKIP.value
+        self.cwsize = 0
+        self.rflag = 0
+        self.cfg1_enable_bch_ecc = 0
+        self.bad_loader = 0
+        self.OOBSIZE = 0
+        self.MAXBLOCK = 0
+        self.UD_SIZE_BYTES = 516
+        self.BAD_BLOCK_BYTE_NUM = 0
+        self.BAD_BLOCK_IN_SPARE_AREA = 0
+        self.ECC_MODE = 0
+        self.bad_loader = 1
+        self.secureboot = secureboottbl["MDM9607"]
+        self.pbl = secgen[5][0]
+        self.qfprom = secgen[5][1]
+        self.memtbl = secgen[5][2]
+        self.chipname = "Unknown"
+        if chipset in config_tbl:
+            self.chipname, self.bam, self.nandbase, self.bcraddr, self.secureboot, self.pbl, \
+                self.qfprom, self.memtbl = config_tbl[chipset]
+            self.bad_loader = 0
+        else:
+            loadername = parent.sahara.programmer.lower()
+            for chipid in config_tbl:
+                if config_tbl[chipid][0] in loadername:
+                    self.chipname, self.bam, self.nandbase, self.bcraddr, self.secureboot, \
+                        self.pbl, self.qfprom, self.memtbl = config_tbl[chipid]
+                    self.bad_loader = 0
+        if chipset == 0xFF:
+            self.bad_loader = 0
+
+
+class nand_toshiba_ids(ctypes.LittleEndianStructure):
+    _fields_ = [
+        ("mid", c_uint8, 8),
+        ("did", c_uint8, 8),
+        ("icn", c_uint8, 2),
+        ("bpc", c_uint8, 2),
+        ("rsvd0", c_uint8, 4),
+        ("page_size", c_uint8, 2),
+        ("spare_size", c_uint8, 2),
+        ("block_size", c_uint8, 2),
+        ("org", c_uint8, 1),
+        ("rsvd1", c_uint8, 1),
+        ("rsvd2", c_uint8, 8),
+    ]
+
+
+class nand_toshiba_id_t(ctypes.Union):
+    _anonymous_ = ("bit",)
+    _fields_ = [
+        ("bit", nand_toshiba_ids),
+        ("asDword", ctypes.c_uint32)
+    ]
+
+
+class nand_samsung_ids(ctypes.LittleEndianStructure):
+    _fields_ = [
+        ("mid", c_uint8, 8),
+        ("did", c_uint8, 8),
+        ("icn", c_uint8, 2),
+        ("bpc", c_uint8, 2),
+        ("nspp", c_uint8, 2),
+        ("ip", c_uint8, 1),
+        ("cp", c_uint8, 1),
+        ("page_size", c_uint8, 2),
+        ("spare_size", c_uint8, 2),
+        ("sam0", c_uint8, 1),
+        ("block_size", c_uint8, 2),
+        ("org", c_uint8, 1),
+        ("sam1", c_uint8, 1),
+        ("ecc", c_uint8, 2),
+        ("plane", c_uint8, 2),
+        ("plane_size", c_uint8, 3),
+        ("rsvd", c_uint8, 1),
+    ]
+
+
+class nand_samsung_id_t(ctypes.Union):
+    _anonymous_ = ("bit",)
+    _fields_ = [
+        ("bit", nand_toshiba_ids),
+        ("asDword", ctypes.c_uint32)
+    ]
+
+
+class NandDevice:
+    # NAND_DEVn_CFG0 bits
+    DISABLE_STATUS_AFTER_WRITE = 4
+    CW_PER_PAGE = 6
+    UD_SIZE_BYTES = 9
+    ECC_PARITY_SIZE_BYTES_RS = 19
+    SPARE_SIZE_BYTES = 23
+    NUM_ADDR_CYCLES = 27
+    STATUS_BFR_READ = 30
+    SET_RD_MODE_AFTER_STATUS = 31
+
+    # NAND_DEV1_CFG0 bits
+    DEV0_CFG1_ECC_DISABLE = 0
+    WIDE_FLASH = 1
+    NAND_RECOVERY_CYCLES = 2
+    CS_ACTIVE_BSY = 5
+    BAD_BLOCK_BYTE_NUM = 6
+    BAD_BLOCK_IN_SPARE_AREA = 16
+    WR_RD_BSY_GAP = 17
+    ENABLE_BCH_ECC = 27
+    ECC_ENCODER_CGC_EN = 23
+    ECC_DECODER_CGC_EN = 24
+    DISABLE_ECC_RESET_AFTER_OPDONE = 25
+    ENABLE_NEW_ECC = 27
+    ECC_MODE_DEV1 = 28  # 28:29
+
+    # NAND_DEV0_ECC_CFG bits
+    ECC_CFG_ECC_DISABLE = 0
+    ECC_SW_RESET = 1
+    ECC_MODE = 4
+    ECC_PARITY_SIZE_BYTES_BCH = 8
+    ECC_NUM_DATA_BYTES = 16
+    ECC_ENC_CLK_SHUTDOWN = 28
+    ECC_DEC_CLK_SHUTDOWN = 29
+    ECC_FORCE_CLK_OPEN = 30
+
+    # NAND_DEV_CMD1 bits
+    READ_ADDR = 0
+
+    # NAND_DEV_CMD_VLD bits
+    READ_START_VLD = 0
+    READ_STOP_VLD = 1
+    WRITE_START_VLD = 2
+    ERASE_START_VLD = 3
+    SEQ_READ_START_VLD = 4
+
+    NAND_CMD_PARAM = 0xec
+    ECC_BCH_4BIT = 2
+
+    def __init__(self, settings):
+        self.settings = settings
+        # device commands
+        self.NAND_CMD_SOFT_RESET = 0x01
+        self.NAND_CMD_PAGE_READ = 0x32
+        self.NAND_CMD_PAGE_READ_ECC = 0x33
+        self.NAND_CMD_PAGE_READ_ALL = 0x34
+        self.NAND_CMD_SEQ_PAGE_READ = 0x15
+        self.NAND_CMD_PRG_PAGE = 0x36
+        self.NAND_CMD_PRG_PAGE_ECC = 0x37
+        self.NAND_CMD_PRG_PAGE_ALL = 0x39
+        self.NAND_CMD_BLOCK_ERASE = 0x3A
+        self.NAND_CMD_FETCH_ID = 0x0B
+        self.NAND_CMD_STATUS = 0x0C
+        self.NAND_CMD_RESET = 0x0D
+
+        # addr offsets
+        self.NAND_FLASH_CMD = settings.nandbase + 0
+        self.NAND_ADDR0 = settings.nandbase + 4
+        self.NAND_ADDR1 = settings.nandbase + 8
+        self.NAND_FLASH_CHIP_SELECT = settings.nandbase + 0xc
+        self.NAND_EXEC_CMD = settings.nandbase + 0x10
+        self.NAND_FLASH_STATUS = settings.nandbase + 0x14
+        self.NAND_BUFFER_STATUS = settings.nandbase + 0x18
+        self.NAND_DEV0_CFG0 = settings.nandbase + 0x20
+        self.NAND_DEV0_CFG1 = settings.nandbase + 0x24
+        self.NAND_DEV0_ECC_CFG = settings.nandbase + 0x28
+        self.NAND_DEV1_ECC_CFG = settings.nandbase + 0x2C
+        self.NAND_DEV1_CFG0 = settings.nandbase + 0x30
+        self.NAND_DEV1_CFG1 = settings.nandbase + 0x34
+        self.NAND_SFLASHC_CMD = settings.nandbase + 0x38
+        self.NAND_SFLASHC_EXEC = settings.nandbase + 0x3C
+        self.NAND_READ_ID = settings.nandbase + 0x40
+        self.NAND_READ_STATUS = settings.nandbase + 0x44
+        self.NAND_CONFIG_DATA = settings.nandbase + 0x50
+        self.NAND_CONFIG = settings.nandbase + 0x54
+        self.NAND_CONFIG_MODE = settings.nandbase + 0x58
+        self.NAND_CONFIG_STATUS = settings.nandbase + 0x60
+        self.NAND_DEV_CMD0 = settings.nandbase + 0xA0
+        self.NAND_DEV_CMD1 = settings.nandbase + 0xA4
+        self.NAND_DEV_CMD2 = settings.nandbase + 0xA8
+        self.NAND_DEV_CMD_VLD = settings.nandbase + 0xAC
+        self.SFLASHC_BURST_CFG = settings.nandbase + 0xE0
+        self.NAND_EBI2_ECC_BUF_CFG = settings.nandbase + 0xF0
+        self.NAND_HW_INFO = settings.nandbase + 0xFC
+        self.NAND_FLASH_BUFFER = settings.nandbase + 0x100
+
+        self.PAGE_ACC = 1 << 4
+        self.LAST_PAGE = 1 << 5
+        self.CW_PER_PAGE = 6
+        self.ECC_CFG_ECC_DISABLE = 0
+        self.flashinfo = None
+
+    def gettbl(self, nandid, tbl):
+        flashinfo = {}
+        tid = nand_toshiba_id_t()
+        tid.asDword = nandid
+        # did,slc_small_device,device_width,density_mbits
+        if tid.did in tbl:
+            fdev = tbl[tid.did]
+            small_slc = fdev[0]
+            slc_device_width = fdev[1]
+            density_mbits = fdev[2]
+        else:
+            return None
+
+        if small_slc:
+            flashinfo["page_size"] = 512
+            flashinfo["feature_flags1_ecc"] = 2
+            flashinfo["block_size_kbytes"] = 16
+            flashinfo["param_per_block"] = 32
+            flashinfo["spare_size"] = 16
+            flashinfo["otp_sequence_cfg"] = "FLASH_NAND_OTP_SEQUENCE_CFG6"
+            flashinfo["dev_width"] = slc_device_width
+        else:
+            if tid.org == 0:
+                flashinfo["dev_width"] = 8
+            else:
+                flashinfo["dev_width"] = 16
+            if tid.spare_size == 0 or tid.spare_size == 1:
+                flashinfo["feature_flags1_ecc"] = 1
+            elif tid.spare_size == 2:
+                flashinfo["feature_flags1_ecc"] = 8
+            else:
+                flashinfo["feature_flags1_ecc"] = 0
+            flashinfo["page_size"] = 1024 << tid.page_size
+            flashinfo["page_size_kb"] = flashinfo["page_size"] >> 10
+            flashinfo["block_size_kb"] = 64 << tid.block_size
+            flashinfo["pages_per_block"] = flashinfo["block_size_kb"] // flashinfo["page_size_kb"]
+            flashinfo["spare_size"] = (8 << tid.spare_size) * (flashinfo["page_size"] // 512)
+            if flashinfo["page_size"] == 2048 or flashinfo["page_size"] == 4096:
+                flashinfo["otp_sequence_cfg"] = "FLASH_NAND_OTP_SEQUENCE_CFG2"
+            else:
+                flashinfo["otp_sequence_cfg"] = "FLASH_NAND_OTP_SEQUENCE_UNKNOWN"
+            flashinfo["block_count"] = (1024 // 8 * density_mbits) // flashinfo["block_size_kb"]
+            if flashinfo["page_size"] == 2048 and flashinfo["feature_flags1_ecc"] > 0:
+                flashinfo["bad_block_info_byte_offset"] = 2048
+                flashinfo["udata_max"] = 16
+                flashinfo["max_corrected_udata_bytes"] = 16
+                flashinfo["bad_block_info_byte_length"] = 1 if flashinfo["dev_width"] == 8 else 2
+            elif flashinfo["page_size"] == 4096 and flashinfo["feature_flags1_ecc"] > 0:
+                flashinfo["bad_block_info_byte_offset"] = 4096
+                flashinfo["udata_max"] = 32
+                flashinfo["max_corrected_udata_bytes"] = 32
+                flashinfo["bad_block_info_byte_length"] = 1 if flashinfo["dev_width"] == 8 else 2
+        self.settings.PAGESIZE = flashinfo["page_size"]
+        self.settings.BLOCKSIZE = flashinfo["block_size_kb"] * 1024
+        if flashinfo["dev_width"] == 8:
+            self.settings.IsWideFlash = 0
+        else:
+            self.settings.IsWideFlash = 1
+        self.settings.MAXBLOCK = flashinfo["block_count"]
+
+        self.settings.BAD_BLOCK_IN_SPARE_AREA = flashinfo["bad_block_info_byte_offset"]
+        return flashinfo
+
+    def toshiba_config(self, nandid):
+        flashinfo = self.gettbl(nandid, toshiba_tbl)
+        self.flashinfo = flashinfo
+        if (nandid >> 8) & 0xFF == 0xac:
+            self.settings.OOBSIZE = 256
+            self.settings.PAGESIZE = 4096
+            self.settings.MAXBLOCK = 2048
+            # 8Bit_HW_ECC
+        elif (nandid >> 8) & 0xFF == 0xaa:
+            self.settings.OOBSIZE = 128
+            self.settings.PAGESIZE = 2048
+            self.settings.MAXBLOCK = 2048
+            # 8Bit_HW_ECC
+        elif (nandid >> 8) & 0xFF == 0xa1:
+            self.settings.OOBSIZE = 128
+            self.settings.PAGESIZE = 2048
+            self.settings.MAXBLOCK = 1024
+            # 8Bit_HW_ECC
+
+        self.settings.CW_PER_PAGE = (self.settings.PAGESIZE >> 9) - 1
+        self.settings.SPARE_SIZE_BYTES = 0
+
+    def samsung_config(self, nandid):
+        flashinfo = self.gettbl(nandid, samsung_tbl)
+        self.flashinfo = flashinfo
+
+        # self.settings.SPARE_SIZE_BYTES = flashinfo["spare_size"]
+        self.settings.CW_PER_PAGE = (self.settings.PAGESIZE >> 9) - 1
+        self.settings.SPARE_SIZE_BYTES = 0
+
+    def generic_config(self, nandid, chipsize):
+        devcfg = (nandid >> 24) & 0xff
+        self.settings.PAGESIZE = 1024 << (devcfg & 0x3)
+        self.settings.BLOCKSIZE = 64 << ((devcfg >> 4) & 0x3)
+
+        if chipsize != 0:
+            self.settings.MAXBLOCK = chipsize * 1024 // self.settings.BLOCKSIZE
+        else:
+            self.settings.MAXBLOCK = 0x800
+        self.settings.CW_PER_PAGE = (self.settings.PAGESIZE >> 9) - 1
+
+    def nand_setup(self, nandid):
+        """
+        qcommand -p%qdl% -k11 -c "m 79b0020 295409c0" #NAND_DEV0_CFG0
+        qcommand -p%qdl% -k11 -c "m 79b0024 08065d5d" #NAND_DEV0_CFG1
+        qcommand -p%qdl% -k11 -c "m 79b0028 42040d10" #NAND_DEV0_ECC_CFG
+        qcommand -p%qdl% -k11 -c "m 79b00f0 00000203" NAND_EBI2_ECC_BUF_CFG
+        """
+
+        fid = (nandid >> 8) & 0xff
+        pid = nandid & 0xff
+
+        self.settings.flash_mfr = ""
+        for info in nand_manuf_ids:
+            if info[0] == pid:
+                self.settings.flash_mfr = info[1]
+                break
+
+        chipsize = 0
+        for info in nand_ids:
+            if info[1] == fid:
+                chipsize = info[2]
+                self.settings.flash_descr = info[0]
+                break
+
+        self.settings.cfg1_enable_bch_ecc = 1
+        self.settings.IsWideFlash = 0
+        self.settings.SPARE_SIZE_BYTES = 0
+        self.settings.OOBSIZE = 0
+        self.settings.ECC_PARITY_SIZE_BYTES = 0
+        self.settings.BAD_BLOCK_BYTE_NUM = 0
+        self.settings.ecc_bit = 4
+
+        if pid == 0x98:  # Toshiba
+            self.toshiba_config(nandid)
+            if nandid == 0x2690AC98:
+                self.settings.ecc_bit = 8
+        elif pid == 0xEC:  # Samsung
+            self.samsung_config(nandid)
+        elif pid == 0x2C:  # Micron
+            self.generic_config(nandid, chipsize)
+            # MT29AZ5A3CHHWD
+            if nandid == 0x2690AC2C or nandid == 0x26D0A32C:
+                self.settings.ecc_bit = 8
+        elif pid == 0x01:
+            self.generic_config(nandid, chipsize)
+            if nandid == 0x1590AC01:  # jsfc 4G
+                self.settings.OOBSIZE = 128
+                self.settings.PAGESIZE = 2048
+                self.settings.SPARE_SIZE_BYTES = 4
+        else:
+            self.generic_config(nandid, chipsize)
+
+        if nandid in supported_flash:
+            nd = supported_flash[nandid]
+            # density = nd[]
+            # width
+            chipsize = nd[0] // 1024
+            self.settings.IsWideFlash = nd[1]
+            self.settings.PAGESIZE = nd[2]
+            self.settings.BLOCKSIZE = nd[3]
+            self.settings.OOBSIZE = nd[4]
+            self.settings.IsOneNand = nd[5]
+
+        if chipsize != 0:
+            self.settings.MAXBLOCK = chipsize * 1024 // self.settings.BLOCKSIZE
+        else:
+            self.settings.MAXBLOCK = 0x800
+
+        self.settings.sectorsize = 512
+        self.settings.sectors_per_page = self.settings.PAGESIZE // self.settings.sectorsize
+
+        if self.settings.ecc_bit == 4:
+            self.settings.ECC_MODE = 0  # 0=4 bit ECC error
+        elif self.settings.ecc_bit == 8:
+            self.settings.ECC_MODE = 1  # 1=8 bit ECC error
+        elif self.settings.ecc_bit == 16:
+            self.settings.ECC_MODE = 2  # 2=16 bit ECC error
+
+        if self.settings.ecc_size == 0:
+            if self.settings.ecc_bit == 4:
+                self.settings.ecc_size = 1
+            elif self.settings.ecc_bit == 8 or self.settings.ecc_bit == 16:
+                self.settings.ecc_size = 2
+
+        if self.settings.OOBSIZE == 0:
+            self.settings.OOBSIZE = (8 << self.settings.ecc_size) * (self.settings.CW_PER_PAGE + 1)
+
+        if 256 >= self.settings.OOBSIZE > 128:
+            self.settings.OOBSIZE = 256
+
+        if self.settings.SPARE_SIZE_BYTES == 0:
+            # HAM1
+            if self.settings.ECC_MODE == 0:
+                self.settings.SPARE_SIZE_BYTES = 4
+            else:
+                self.settings.SPARE_SIZE_BYTES = 2
+
+        if self.settings.cfg1_enable_bch_ecc:
+            hw_ecc_bytes = 0
+            self.settings.UD_SIZE_BYTES = self.settings.SPARE_SIZE_BYTES + self.settings.sectorsize  # 516 or 517
+            if self.settings.SPARE_SIZE_BYTES == 2:
+                self.settings.UD_SIZE_BYTES += 2
+            if self.settings.IsWideFlash:
+                self.settings.UD_SIZE_BYTES += 1
+        else:
+            hw_ecc_bytes = 10
+            self.settings.UD_SIZE_BYTES = 512
+
+        if self.settings.ECC_PARITY_SIZE_BYTES == 0:
+            self.settings.ECC_PARITY_SIZE_BYTES = 3  # HAM1
+            if self.settings.ecc_bit == 4:  # BCH4
+                self.settings.ECC_PARITY_SIZE_BYTES = 7
+            elif self.settings.ecc_bit == 8:  # BCH8
+                self.settings.ECC_PARITY_SIZE_BYTES = 13
+            elif self.settings.ecc_bit == 16:  # BCH16
+                self.settings.ECC_PARITY_SIZE_BYTES = 26
+
+        linuxcwsize = 528
+        if self.settings.cfg1_enable_bch_ecc and self.settings.ecc_bit == 8:
+            linuxcwsize = 532
+        if nandid == 0x1590AC2C:  # fixme
+            linuxcwsize = 532
+        if self.settings.BAD_BLOCK_BYTE_NUM == 0:
+            self.settings.BAD_BLOCK_BYTE_NUM = (
+                    self.settings.PAGESIZE - (linuxcwsize * (self.settings.sectors_per_page - 1)) + 1)
+
+        # UD_SIZE_BYTES must be 512, 516 or 517. If ECC-Protection 516 for x16Bit-Nand and 517 for x8-bit Nand
+        cfg0 = 0 << self.SET_RD_MODE_AFTER_STATUS \
+            | 0 << self.STATUS_BFR_READ \
+            | 5 << self.NUM_ADDR_CYCLES \
+            | self.settings.SPARE_SIZE_BYTES << self.SPARE_SIZE_BYTES \
+            | hw_ecc_bytes << self.ECC_PARITY_SIZE_BYTES_RS \
+            | self.settings.UD_SIZE_BYTES << self.UD_SIZE_BYTES \
+            | self.settings.CW_PER_PAGE << self.CW_PER_PAGE \
+            | 0 << self.DISABLE_STATUS_AFTER_WRITE
+
+        bad_block_byte = self.settings.BAD_BLOCK_BYTE_NUM
+        wide_bus = self.settings.IsWideFlash
+        bch_disabled = self.settings.args_disable_ecc  # option in gui, implemented
+
+        cfg1 = 0 << self.ECC_MODE_DEV1 \
+            | 1 << self.ENABLE_NEW_ECC \
+            | 0 << self.DISABLE_ECC_RESET_AFTER_OPDONE \
+            | 0 << self.ECC_DECODER_CGC_EN \
+            | 0 << self.ECC_ENCODER_CGC_EN \
+            | 2 << self.WR_RD_BSY_GAP \
+            | 0 << self.BAD_BLOCK_IN_SPARE_AREA \
+            | bad_block_byte << self.BAD_BLOCK_BYTE_NUM \
+            | 0 << self.CS_ACTIVE_BSY \
+            | 7 << self.NAND_RECOVERY_CYCLES \
+            | wide_bus << self.WIDE_FLASH \
+            | bch_disabled << self.ENABLE_BCH_ECC
+
+        """
+        cfg0_raw = (self.settings.CW_PER_PAGE-1) << CW_PER_PAGE \
+                    | self.settings.UD_SIZE_BYTES << UD_SIZE_BYTES \
+                    | 5 << NUM_ADDR_CYCLES \
+                    | 0 << SPARE_SIZE_BYTES
+
+        cfg1_raw = 7 << NAND_RECOVERY_CYCLES \
+                    | 0 << CS_ACTIVE_BSY \
+                    | 17 << BAD_BLOCK_BYTE_NUM \
+                    | 1 << BAD_BLOCK_IN_SPARE_AREA \
+                    | 2 << WR_RD_BSY_GAP \
+                    | wide_bus << WIDE_FLASH \
+                    | 1 << DEV0_CFG1_ECC_DISABLE
+        """
+        ecc_bch_cfg = 1 << self.ECC_FORCE_CLK_OPEN \
+            | 0 << self.ECC_DEC_CLK_SHUTDOWN \
+            | 0 << self.ECC_ENC_CLK_SHUTDOWN \
+            | self.settings.UD_SIZE_BYTES << self.ECC_NUM_DATA_BYTES \
+            | self.settings.ECC_PARITY_SIZE_BYTES << self.ECC_PARITY_SIZE_BYTES_BCH \
+            | self.settings.ECC_MODE << self.ECC_MODE \
+            | 0 << self.ECC_SW_RESET \
+            | bch_disabled << self.ECC_CFG_ECC_DISABLE
+
+        if self.settings.UD_SIZE_BYTES == 516:
+            ecc_buf_cfg = 0x203
+        elif self.settings.UD_SIZE_BYTES == 517:
+            ecc_buf_cfg = 0x204
+        else:
+            ecc_buf_cfg = 0x1FF
+
+        return cfg0, cfg1, ecc_buf_cfg, ecc_bch_cfg
+
+
+class nandregs:
+    def __init__(self, parent):
+        self.register_mapping = {
+        }
+        self.reverse_mapping = {}
+        self.create_reverse_mapping()
+        self.parent = parent
+
+    def __getattribute__(self, name):
+        if name in ("register_mapping", "parent"):
+            return super(nandregs, self).__getattribute__(name)
+
+        if name in self.register_mapping:
+            return self.parent.mempeek(self.register_mapping[name])
+
+        return super(nandregs, self).__getattribute__(name)
+
+    def __setattr__(self, name, value):
+        if name in ("register_mapping", "parent"):
+            super(nandregs, self).__setattr__(name, value)
+
+        if name in self.register_mapping:
+            self.parent.mempoke(self.register_mapping[name], value)
+        else:
+            super(nandregs, self).__setattr__(name, value)
+
+    def read(self, register):
+        if isinstance(register, str):
+            register = self.register_mapping.get(register.lower(), None)
+        return self.parent.mempeek(register)
+
+    def write(self, register, value):
+        if isinstance(register, str):
+            register = self.register_mapping.get(register.lower(), None)
+        return self.parent.mempoke(register, value)
+
+    def save(self):
+        reg_dict = {}
+        for reg in self.register_mapping:
+            reg_v = self.read(reg)
+            reg_dict[reg] = reg_v
+        return reg_dict
+
+    def restore(self, value=None):
+        if value is None:
+            value = {}
+        for reg in self.register_mapping:
+            reg_v = value[reg]
+            self.write(reg, reg_v)
+
+    def create_reverse_mapping(self):
+        self.reverse_mapping = {v: k for k, v in self.register_mapping.items()}
+

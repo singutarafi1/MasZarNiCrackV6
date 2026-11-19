@@ -1,0 +1,3934 @@
+
+==================================================
+FILE: edl/Library/streaming_client.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2021
+import sys
+import os
+import logging
+from binascii import hexlify, unhexlify
+from struct import unpack, pack
+from edl.Library.streaming import Streaming
+from edl.Library.utils import do_tcp_server, LogBase, getint
+
+
+class streaming_client(metaclass=LogBase):
+    def __init__(self, arguments, cdc, sahara, loglevel, printer):
+        self.cdc = cdc
+        self.__logger = self.__logger
+        self.sahara = sahara
+        self.arguments = arguments
+        self.streaming = Streaming(cdc, sahara, loglevel)
+        self.printer = printer
+        self.__logger.setLevel(loglevel)
+        self.error = self.__logger.error
+        self.info = self.__logger.info
+        if loglevel == logging.DEBUG:
+            logfilename = "log.txt"
+            fh = logging.FileHandler(logfilename)
+            self.__logger.addHandler(fh)
+
+    def disconnect(self):
+        self.cdc.close()
+        sys.exit(0)
+
+    def check_param(self, parameters):
+        error = False
+        params = ""
+        for parameter in parameters:
+            params += parameter + " "
+            if parameter not in parameters:
+                error = True
+        if error:
+            if len(parameters) == 1:
+                self.printer("Argument " + params + "required.")
+            else:
+                self.printer("Arguments " + params + "required.")
+            return False
+        return True
+
+    def print_partitions(self, partitions):
+        self.printer("Name            Offset\t\tLength\t\tAttr\t\t\tFlash")
+        self.printer("-------------------------------------------------------------")
+        for name in partitions:
+            partition = partitions[name]
+            for i in range(0x10 - len(name)):
+                name += " "
+            offset = partition[
+                         "offset"] * self.streaming.settings.num_pages_per_blk * self.streaming.settings.PAGESIZE
+            length = partition[
+                         "length"] * self.streaming.settings.num_pages_per_blk * self.streaming.settings.PAGESIZE
+            attr1 = partition["attr1"]
+            attr2 = partition["attr2"]
+            attr3 = partition["attr3"]
+            which_flash = partition["which_flash"]
+            self.printer(
+                f"{name}\t%08X\t%08X\t{hex(attr1)}/{hex(attr2)}/{hex(attr3)}\t{which_flash}" % (offset, length))
+
+    def handle_streaming(self, cmd, options):
+        mode = 0
+        """
+        offset = getint(options["<offset>"])
+        length = getint(options["<length>"])
+        filename = options["<filename>"]
+        self.streaming.streaming_mode=self.streaming.Qualcomm
+        self.streaming.memread=self.streaming.qc_memread
+        self.streaming.memtofile(offset, length, filename)
+        """
+
+        if "<mode>" in options:
+            mode = options["<mode>"]
+        if self.streaming.connect(mode):
+            xflag = 0
+            self.streaming.hdlc.receive_reply(5)
+            if self.streaming.streaming_mode == self.streaming.Patched:
+                self.streaming.nand_init(xflag)
+            if cmd == "gpt":
+                directory = options["<directory>"]
+                if directory is None:
+                    directory = ""
+                data = self.streaming.read_partition_table()
+                sfilename = os.path.join(directory, f"partition.bin")
+                if data != b"":
+                    with open(sfilename, "wb") as write_handle:
+                        write_handle.write(data)
+                    self.printer(f"Dumped Partition Table to {sfilename}")
+                else:
+                    self.error(f"Error on dumping partition table to {sfilename}")
+            elif cmd == "printgpt":
+                partitions = self.streaming.get_partitions()
+                self.print_partitions(partitions)
+                self.streaming.nand_post()
+            elif cmd == "r":
+                partitionname = options["<partitionname>"]
+                filename = options["<filename>"]
+                filenames = filename.split(",")
+                partitions = partitionname.split(",")
+                if len(partitions) != len(filenames):
+                    self.error("You need to gives as many filenames as given partitions.")
+                    return
+                i = 0
+                rpartitions = self.streaming.get_partitions()
+                for partition in partitions:
+                    if partition.lower() in rpartitions:
+                        spartition = rpartitions[partition]
+                        offset = spartition["offset"]
+                        length = spartition["length"]
+                        # attr1 = spartition["attr1"]
+                        # attr2 = spartition["attr2"]
+                        # attr3 = spartition["attr3"]
+                        partfilename = filenames[i]
+                        self.printer(f"Dumping Partition {partition}...")
+                        self.streaming.read_raw(offset, length, self.streaming.settings.UD_SIZE_BYTES, partfilename)
+                        self.printer(f"Dumped sector {str(offset)} with sector count {str(length)} as {partfilename}.")
+                    else:
+                        self.error(f"Error: Couldn't detect partition: {partition}\nAvailable partitions:")
+                        self.print_partitions(rpartitions)
+            elif cmd == "rs":
+                sector = getint(options["<start_sector>"])  # Page
+                sectors = getint(options["<sectors>"])
+                filename = options["<filename>"]
+                self.printer(f"Dumping at Sector {hex(sector)} with Sectorcount {hex(sectors)}...")
+                if self.streaming.read_sectors(sector, sectors, filename, True):
+                    self.printer(f"Dumped sector {str(sector)} with sector count {str(sectors)} as {filename}.")
+            elif cmd == "rf":
+                sector = 0
+                sectors = self.streaming.settings.MAXBLOCK * self.streaming.settings.num_pages_per_blk * \
+                    self.streaming.settings.sectors_per_page
+                filename = options["<filename>"]
+                self.printer(f"Dumping Flash from sector 0 to sector {hex(sectors)}...")
+                if self.streaming.read_sectors(sector, sectors, filename, True):
+                    self.printer(f"Dumped sector {str(sector)} with sector count {str(sectors)} as {filename}.")
+            elif cmd == "rl":
+                directory = options["<directory>"]
+                if options["--skip"]:
+                    skip = options["--skip"].split(",")
+                else:
+                    skip = []
+                if not os.path.exists(directory):
+                    os.mkdir(directory)
+                storedir = directory
+                if not os.path.exists(storedir):
+                    os.mkdir(storedir)
+                sfilename = os.path.join(storedir, f"partition.bin")
+                partdata = self.streaming.read_partition_table()
+                if partdata != -1:
+                    with open(sfilename, "wb") as write_handle:
+                        write_handle.write(partdata)
+                else:
+                    self.error(f"Couldn't detect partition header.")
+                    return
+                partitions = self.streaming.get_partitions()
+                for partition in partitions:
+                    if partition in skip:
+                        continue
+                    filename = os.path.join(storedir, partition + ".bin")
+                    spartition = partitions[partition]
+                    offset = spartition["offset"]
+                    length = spartition["length"]
+                    # attr1 = spartition["attr1"]
+                    # attr2 = spartition["attr2"]
+                    # attr3 = spartition["attr3"]
+                    partfilename = filename
+                    self.info(f"Dumping partition {str(partition)} with block count {str(length)} as " +
+                              f"{filename}.")
+                    self.streaming.read_raw(offset, length, self.streaming.settings.UD_SIZE_BYTES, partfilename)
+            elif cmd == "peek":
+                offset = getint(options["<offset>"])
+                length = getint(options["<length>"])
+                filename = options["<filename>"]
+                if self.streaming.memtofile(offset, length, filename):
+                    self.info(
+                        f"Peek data from offset {hex(offset)} and length {hex(length)} was written to {filename}")
+            elif cmd == "peekhex":
+                offset = getint(options["<offset>"])
+                length = getint(options["<length>"])
+                resp = self.streaming.memread(offset, length)
+                self.printer("\n")
+                self.printer(hexlify(resp))
+            elif cmd == "peekqword":
+                offset = getint(options["<offset>"])
+                resp = self.streaming.memread(offset, 8)
+                self.printer("\n")
+                self.printer(hex(unpack("<Q", resp[:8])[0]))
+            elif cmd == "peekdword":
+                offset = getint(options["<offset>"])
+                resp = self.streaming.mempeek(offset)
+                self.printer("\n")
+                self.printer(hex(resp))
+            elif cmd == "poke":
+                offset = getint(options["<offset>"])
+                filename = unhexlify(options["<filename>"])
+                try:
+                    with open(filename, "rb") as rf:
+                        data = rf.read()
+                        if self.streaming.memwrite(offset, data):
+                            self.info("Poke succeeded.")
+                        else:
+                            self.error("Poke failed.")
+                except Exception as e:
+                    self.error(str(e))
+            elif cmd == "pokehex":
+                offset = getint(options["<offset>"])
+                data = unhexlify(options["<data>"])
+                if self.streaming.memwrite(offset, data):
+                    self.info("Poke succeeded.")
+                else:
+                    self.error("Poke failed.")
+            elif cmd == "pokeqword":
+                offset = getint(options["<offset>"])
+                data = pack("<Q", getint(options["<data>"]))
+                if self.streaming.memwrite(offset, data):
+                    self.info("Poke succeeded.")
+                else:
+                    self.error("Poke failed.")
+            elif cmd == "pokedword":
+                offset = getint(options["<offset>"])
+                data = pack("<I", getint(options["<data>"]))
+                if self.streaming.mempoke(offset, data):
+                    self.info("Poke succeeded.")
+                else:
+                    self.error("Poke failed.")
+            elif cmd == "reset":
+                if self.streaming.reset():
+                    self.info("Reset succeeded.")
+            elif cmd == "memtbl":
+                filename = options["<filename>"]
+                memtbl = self.streaming.settings.memtbl
+                data = self.streaming.memread(memtbl[0], memtbl[1])
+                if data != b"":
+                    with open(filename, "wb") as wf:
+                        wf.write(data)
+                        self.printer(f"Dumped memtbl at offset {hex(memtbl[0])} as {filename}.")
+                else:
+                    self.error("Error on dumping memtbl")
+            elif cmd == "secureboot":
+                value = self.streaming.mempeek(self.streaming.settings.secureboot)
+                if value != -1:
+                    is_secure = False
+                    for area in range(0, 4):
+                        sec_boot = (value >> (area * 8)) & 0xFF
+                        pk_hashindex = sec_boot & 3
+                        oem_pkhash = True if ((sec_boot >> 4) & 1) == 1 else False
+                        auth_enabled = True if ((sec_boot >> 5) & 1) == 1 else False
+                        use_serial = True if ((sec_boot >> 6) & 1) == 1 else False
+                        if auth_enabled:
+                            is_secure = True
+                        self.printer(f"Sec_Boot{str(area)} PKHash-Index:{str(pk_hashindex)} " +
+                                     f"OEM_PKHash: {str(oem_pkhash)} " +
+                                     f"Auth_Enabled: {str(auth_enabled)} " +
+                                     f"Use_Serial: {str(use_serial)}")
+                    if is_secure:
+                        self.printer("Secure boot enabled.")
+                    else:
+                        self.printer("Secure boot disabled.")
+                else:
+                    self.error("Unknown target chipset")
+            elif cmd == "pbl":
+                filename = options["<filename>"]
+                pbl = self.streaming.settings.pbl
+                self.printer("Dumping pbl....")
+                data = self.streaming.memread(pbl[0], pbl[1])
+                if data != b"":
+                    with open(filename, "wb") as wf:
+                        wf.write(data)
+                        self.printer(f"Dumped pbl at offset {hex(pbl[0])} as {filename}.")
+                else:
+                    self.error("Error on dumping pbl")
+            elif cmd == "qfp":
+                filename = options["<filename>"]
+                qfp = self.streaming.settings.qfprom
+                self.printer("Dumping qfprom....")
+                data = self.streaming.memread(qfp[0], qfp[1])
+                if data != b"":
+                    with open(filename, "wb") as wf:
+                        wf.write(data)
+                        self.printer(f"Dumped qfprom at offset {hex(qfp[0])} as {filename}.")
+                else:
+                    self.error("Error on dumping qfprom")
+            elif cmd == "memcpy":
+                if not self.check_param(["<offset>", "<size>"]):
+                    return False
+                srcoffset = getint(options["<offset>"])
+                size = getint(options["<size>"])
+                dstoffset = srcoffset + size
+                if self.streaming.cmd_memcpy(dstoffset, srcoffset, size):
+                    self.printer(f"Memcpy from {hex(srcoffset)} to {hex(dstoffset)} succeeded")
+                    return True
+                else:
+                    return False
+            ###############################
+            elif cmd == "nop":
+                # resp=self.streaming.send(b"\x7E\x09")
+                self.error("Nop command isn't supported by streaming loader")
+                return True
+            elif cmd == "setbootablestoragedrive":
+                self.error("setbootablestoragedrive command isn't supported by streaming loader")
+                return True
+            elif cmd == "getstorageinfo":
+                self.error("getstorageinfo command isn't supported by streaming loader")
+                return True
+            elif cmd == "w":
+                if not self.check_param(["<partitionname>", "<filename>"]):
+                    return False
+                partitionname = options["<partitionname>"]
+                filename = options["<filename>"]
+                partitionfilename = ""
+                if "--partitionfilename" in options:
+                    partitionfilename = options["--partitionfilename"]
+                    if not os.path.exists(partitionfilename):
+                        self.error(f"Error: Couldn't find partition file: {partitionfilename}")
+                        return False
+                if not os.path.exists(filename):
+                    self.error(f"Error: Couldn't find file: {filename}")
+                    return False
+                if partitionfilename == "":
+                    rpartitions = self.streaming.get_partitions()
+                else:
+                    rpartitions = self.streaming.get_partitions(partitionfilename)
+                if self.streaming.enter_flash_mode():
+                    if partitionname in rpartitions:
+                        spartition = rpartitions[partitionname]
+                        offset = spartition["offset"]
+                        length = spartition["length"]
+                        # attr1 = spartition["attr1"]
+                        # attr2 = spartition["attr2"]
+                        # attr3 = spartition["attr3"]
+                        sectors = int(os.stat(
+                            filename).st_size / self.streaming.settings.num_pages_per_blk /
+                                      self.streaming.settings.PAGESIZE)
+                        if sectors > length:
+                            self.error(
+                                f"Error: {filename} has {sectors} sectors but partition only has {length}.")
+                            return False
+                        if self.streaming.modules is not None:
+                            self.streaming.modules.writeprepare()
+                        if self.streaming.write_flash(partitionname, filename):
+                            self.printer(f"Wrote {filename} to sector {str(offset)}.")
+                            return True
+                        else:
+                            self.printer(f"Error writing {filename} to sector {str(offset)}.")
+                            return False
+                    else:
+                        self.error(f"Error: Couldn't detect partition: {partitionname}\nAvailable partitions:")
+                        self.print_partitions(rpartitions)
+                return False
+            elif cmd == "wl":
+                if not self.check_param(["<directory>"]):
+                    return False
+                directory = options["<directory>"]
+                if options["--skip"]:
+                    skip = options["--skip"].split(",")
+                else:
+                    skip = []
+                if not os.path.exists(directory):
+                    self.error(f"Error: Couldn't find directory: {directory}")
+                    return False
+                filenames = []
+                if self.streaming.enter_flash_mode():
+                    if self.streaming.modules is not None:
+                        self.streaming.modules.writeprepare()
+                    rpartitions = self.streaming.get_partitions()
+                    for dirName, subdirList, fileList in os.walk(directory):
+                        for fname in fileList:
+                            filenames.append(os.path.join(dirName, fname))
+                            for filename in filenames:
+                                for partition in rpartitions:
+                                    partname = filename[filename.rfind("/") + 1:]
+                                    if ".bin" in partname[-4:]:
+                                        partname = partname[:-4]
+                                    if partition == partname:
+                                        if partition in skip:
+                                            continue
+                                        spartition = rpartitions[partition]
+                                        offset = spartition["offset"]
+                                        length = spartition["length"]
+                                        # attr1 = spartition["attr1"]
+                                        # attr2 = spartition["attr2"]
+                                        # attr3 = spartition["attr3"]
+                                        sectors = int(os.stat(filename).st_size /
+                                                      self.streaming.settings.num_pages_per_blk /
+                                                      self.streaming.settings.PAGESIZE)
+                                        if sectors > length:
+                                            self.error(
+                                                f"Error: {filename} has {sectors} sectors but partition only has {length}.")
+                                            return False
+                                        self.printer(f"Writing {filename} to partition {str(partition)}.")
+                                        self.streaming.write_flash(partition, filename)
+                        else:
+                            self.printer("Couldn't write partition. Either wrong memorytype given or no gpt partition.")
+                            return False
+                return True
+            elif cmd == "ws":
+                self.error("ws command isn't supported by streaming loader")  # todo
+                return False
+            elif cmd == "wf":
+                self.error("wf command isn't supported by streaming loader")  # todo
+                return False
+            elif cmd == "e":
+                self.error("e command isn't supported by streaming loader")  # todo
+                return False
+            elif cmd == "es":
+                self.error("es command isn't supported by streaming loader")  # todo
+                return False
+            elif cmd == "xml":
+                self.error("xml command isn't supported by streaming loader")
+                return False
+            elif cmd == "rawxml":
+                self.error("rawxml command isn't supported by streaming loader")
+                return False
+            elif cmd == "send":
+                self.error("send command isn't supported by streaming loader")
+                return False
+            ###############################
+            elif cmd == "server":
+                return do_tcp_server(self, options, self.handle_streaming)
+            elif cmd == "modules":
+                if not self.check_param(["<command>", "<options>"]):
+                    return False
+                command = options["<command>"]
+                options = options["<options>"]
+                if self.streaming.modules is None:
+                    self.error("Feature is not supported")
+                    return False
+                else:
+                    return self.streaming.modules.run(mainargs=options, command=command)
+            else:
+                self.error("Unknown/Missing command, a command is required.")
+                return False
+
+
+==================================================
+FILE: edl/Library/usblib.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2021
+import io
+import logging
+
+import usb.core  # pyusb
+import usb.util
+import time
+import inspect
+import array
+import usb.backend.libusb0
+import usb.backend.libusb1
+from enum import Enum
+from binascii import hexlify
+from ctypes import c_void_p, c_int
+from edl.Library.utils import *
+
+USB_DIR_OUT = 0  # to device
+USB_DIR_IN = 0x80  # to host
+
+# USB types, the second of three bRequestType fields
+USB_TYPE_MASK = (0x03 << 5)
+USB_TYPE_STANDARD = (0x00 << 5)
+USB_TYPE_CLASS = (0x01 << 5)
+USB_TYPE_VENDOR = (0x02 << 5)
+USB_TYPE_RESERVED = (0x03 << 5)
+
+# USB recipients, the third of three bRequestType fields
+USB_RECIP_MASK = 0x1f
+USB_RECIP_DEVICE = 0x00
+USB_RECIP_INTERFACE = 0x01
+USB_RECIP_ENDPOINT = 0x02
+USB_RECIP_OTHER = 0x03
+# From Wireless USB 1.0
+USB_RECIP_PORT = 0x04
+USB_RECIP_RPIPE = 0x05
+
+tag = 0
+
+CDC_CMDS = {
+    "SEND_ENCAPSULATED_COMMAND": 0x00,
+    "GET_ENCAPSULATED_RESPONSE": 0x01,
+    "SET_COMM_FEATURE": 0x02,
+    "GET_COMM_FEATURE": 0x03,
+    "CLEAR_COMM_FEATURE": 0x04,
+    "SET_LINE_CODING": 0x20,
+    "GET_LINE_CODING": 0x21,
+    "SET_CONTROL_LINE_STATE": 0x22,
+    "SEND_BREAK": 0x23,  # wValue is break time
+}
+
+
+class UsbClass(metaclass=LogBase):
+    
+    def load_windows_dll(self):
+        if os.name == 'nt':
+            windows_dir = None
+            try:
+                # add pygame folder to Windows DLL search paths
+                windows_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), "..", "Windows")
+                try:
+                    os.add_dll_directory(windows_dir)
+                except Exception:
+                    pass
+                os.environ['PATH'] = windows_dir + ';' + os.environ['PATH']
+            except Exception:
+                pass
+            del windows_dir
+
+    def __init__(self, loglevel=logging.INFO, portconfig=None, devclass=-1):
+        self.load_windows_dll()
+        self.connected = False
+        self.timeout = None
+        self.vid = None
+        self.pid = None
+        self.device = None
+        self.EP_IN = None
+        self.EP_OUT = None
+        self.interface = None
+        self.stopbits = None
+        self.databits = None
+        self.baudrate = None
+        self.parity = None
+        self.configuration = None
+        self.backend = None
+        self.loglevel = loglevel
+        self.portconfig = portconfig
+        self.devclass = devclass
+        self.__logger = self.__logger
+        self.info = self.__logger.info
+        self.error = self.__logger.error
+        self.warning = self.__logger.warning
+        self.debug = self.__logger.debug
+        self.__logger.setLevel(loglevel)
+        self.buffer = array.array('B', [0]) * 1048576
+        if loglevel == logging.DEBUG:
+            logfilename = "log.txt"
+            fh = logging.FileHandler(logfilename)
+            self.__logger.addHandler(fh)
+
+        if sys.platform.startswith('freebsd') or sys.platform.startswith('linux'):
+            self.backend = usb.backend.libusb1.get_backend(find_library=lambda x: "libusb-1.0.so")
+        elif sys.platform.startswith('win32'):
+            self.backend = usb.backend.libusb1.get_backend(find_library=lambda x: "libusb-1.0.dll")
+        if self.backend is not None:
+            self.backend.lib.libusb_set_option.argtypes = [c_void_p, c_int]
+            self.backend.lib.libusb_set_option(self.backend.ctx, 1)
+
+    def verify_data(self, data, pre="RX:"):
+        self.debug("", stack_info=True)
+        if isinstance(data, bytes) or isinstance(data, bytearray):
+            if data[:5] == b"<?xml":
+                try:
+                    rdata = b""
+                    for line in data.split(b"\n"):
+                        try:
+                            self.debug(pre + line.decode('utf-8'))
+                            rdata += line + b"\n"
+                        except Exception as e:  # pylint: disable=broad-except
+                            v = hexlify(line)
+                            self.debug(str(e))
+                            self.debug(pre + v.decode('utf-8'))
+                    return rdata
+                except Exception as e:  # pylint: disable=broad-except
+                    self.debug(str(e))
+                    pass
+            if logging.DEBUG >= self.__logger.level:
+                self.debug(pre + hexlify(data).decode('utf-8'))
+        else:
+            if logging.DEBUG >= self.__logger.level:
+                self.debug(pre + data)
+        return data
+
+    def getinterfacecount(self):
+        if self.vid is not None:
+            self.device = usb.core.find(idVendor=self.vid, idProduct=self.pid)
+            if self.device is None:
+                self.debug("Couldn't detect the device. Is it connected ?")
+                return False
+            try:
+                self.device.set_configuration()
+            except Exception as e:
+                self.debug(str(e))
+                pass
+            self.configuration = self.device.get_active_configuration()
+            self.debug(2, self.configuration)
+            return self.configuration.bNumInterfaces
+        else:
+            self.error("No device detected. Is it connected ?")
+        return 0
+
+    def setlinecoding(self, baudrate=None, parity=0, databits=8, stopbits=1):
+        sbits = {1: 0, 1.5: 1, 2: 2}
+        dbits = {5, 6, 7, 8, 16}
+        pmodes = {0, 1, 2, 3, 4}
+        brates = {300, 600, 1200, 2400, 4800, 9600, 14400,
+                  19200, 28800, 38400, 57600, 115200, 230400}
+
+        if stopbits is not None:
+            if stopbits not in sbits.keys():
+                valid = ", ".join(str(k) for k in sorted(sbits.keys()))
+                raise ValueError("Valid stopbits are " + valid)
+            self.stopbits = stopbits
+        else:
+            self.stopbits = 0
+
+        if databits is not None:
+            if databits not in dbits:
+                valid = ", ".join(str(d) for d in sorted(dbits))
+                raise ValueError("Valid databits are " + valid)
+            self.databits = databits
+        else:
+            self.databits = 0
+
+        if parity is not None:
+            if parity not in pmodes:
+                valid = ", ".join(str(pm) for pm in sorted(pmodes))
+                raise ValueError("Valid parity modes are " + valid)
+            self.parity = parity
+        else:
+            self.parity = 0
+
+        if baudrate is not None:
+            if baudrate not in brates:
+                brs = sorted(brates)
+                dif = [abs(br - baudrate) for br in brs]
+                best = brs[dif.index(min(dif))]
+                raise ValueError(
+                    "Invalid baudrates, nearest valid is {}".format(best))
+            self.baudrate = baudrate
+
+        linecode = [
+            self.baudrate & 0xff,
+            (self.baudrate >> 8) & 0xff,
+            (self.baudrate >> 16) & 0xff,
+            (self.baudrate >> 24) & 0xff,
+            sbits[self.stopbits],
+            self.parity,
+            self.databits]
+
+        txdir = 0  # 0:OUT, 1:IN
+        req_type = 1  # 0:std, 1:class, 2:vendor
+        recipient = 1  # 0:device, 1:interface, 2:endpoint, 3:other
+        req_type = (txdir << 7) + (req_type << 5) + recipient
+        data = bytearray(linecode)
+        wlen = self.device.ctrl_transfer(
+            req_type, CDC_CMDS["SET_LINE_CODING"],
+            data_or_wlength=data, windex=1)
+        self.debug("Linecoding set, {}b sent".format(wlen))
+
+    def setbreak(self):
+        txdir = 0  # 0:OUT, 1:IN
+        req_type = 1  # 0:std, 1:class, 2:vendor
+        recipient = 1  # 0:device, 1:interface, 2:endpoint, 3:other
+        req_type = (txdir << 7) + (req_type << 5) + recipient
+        wlen = self.device.ctrl_transfer(
+            bmrequesttype=req_type, brequest=CDC_CMDS["SEND_BREAK"],
+            wvalue=0, data_or_wlength=0, windex=1)
+        self.debug("Break set, {}b sent".format(wlen))
+
+    def setcontrollinestate(self, rts=None, dtr=None, isftdi=False):
+        ctrlstate = (2 if rts else 0) + (1 if dtr else 0)
+        if isftdi:
+            ctrlstate += (1 << 8) if dtr is not None else 0
+            ctrlstate += (2 << 8) if rts is not None else 0
+        txdir = 0  # 0:OUT, 1:IN
+        req_type = 2 if isftdi else 1  # 0:std, 1:class, 2:vendor
+        # 0:device, 1:interface, 2:endpoint, 3:other
+        recipient = 0 if isftdi else 1
+        req_type = (txdir << 7) + (req_type << 5) + recipient
+
+        wlen = self.device.ctrl_transfer(
+            bmrequesttype=req_type,
+            brequest=1 if isftdi else CDC_CMDS["SET_CONTROL_LINE_STATE"],
+            wvalue=ctrlstate,
+            windex=1,
+            data_or_wlength=0)
+        self.debug("Linecoding set, {}b sent".format(wlen))
+
+    def connect(self, EP_IN=-1, EP_OUT=-1):
+        if self.connected:
+            self.close()
+            self.connected = False
+        for usbid in self.portconfig:
+            vid = usbid[0]
+            pid = usbid[1]
+            interface = usbid[2]
+            self.device = usb.core.find(idVendor=vid, idProduct=pid, backend=self.backend)
+            if self.device is not None:
+                self.vid = vid
+                self.pid = pid
+                self.interface = interface
+                break
+
+        if self.device is None:
+            self.debug("Couldn't detect the device. Is it connected ?")
+            return False
+
+
+        try:
+            if self.device is not None:
+                self.configuration = self.device.get_active_configuration()
+        except usb.core.USBError as e:
+                if e.strerror == "Configuration not set":
+                    self.device.set_configuration()
+                    self.configuration = self.device.get_active_configuration()
+                if e.errno == 13:
+                    self.backend = usb.backend.libusb0.get_backend()
+                    self.device = usb.core.find(idVendor=vid, idProduct=pid, backend=self.backend)
+
+        if self.interface == -1:
+            for interfacenum in range(0, self.configuration.bNumInterfaces):
+                itf = usb.util.find_descriptor(self.configuration, bInterfaceNumber=interfacenum)
+                try:
+                    if self.device.is_kernel_driver_active(interfacenum):
+                        self.debug("Detaching kernel driver")
+                        self.device.detach_kernel_driver(interfacenum)
+                except Exception as err:
+                    self.debug("No kernel driver supported: " + str(err))
+
+                usb.util.claim_interface(self.device, interfacenum)
+                if self.devclass != -1:
+                    if itf.bInterfaceClass == self.devclass:  # MassStorage
+                        self.interface = interfacenum
+                        break
+                else:
+                    self.interface = interfacenum
+                    break
+
+        self.debug(self.configuration)
+        if self.interface > self.configuration.bNumInterfaces:
+            print("Invalid interface, max number is %d" % self.configuration.bNumInterfaces)
+            return False
+        if self.interface != -1:
+            itf = usb.util.find_descriptor(self.configuration, bInterfaceNumber=self.interface)
+            if EP_OUT == -1:
+                # match the first OUT endpoint
+                self.EP_OUT = usb.util.find_descriptor(itf,
+                                                       custom_match=lambda em: usb.util.endpoint_direction(
+                                                           em.bEndpointAddress) == usb.util.ENDPOINT_OUT)
+            else:
+                self.EP_OUT = EP_OUT
+            if EP_IN == -1:
+                # match the first OUT endpoint
+                self.EP_IN = usb.util.find_descriptor(itf,
+                                                      custom_match=lambda em: usb.util.endpoint_direction(
+                                                          em.bEndpointAddress) == usb.util.ENDPOINT_IN)
+            else:
+                self.EP_IN = EP_IN
+
+            self.connected = True
+            return True
+        else:
+            print("Couldn't find MassStorage interface. Aborting.")
+            self.connected = False
+            return False
+
+    def close(self, reset=False):
+        if self.connected:
+            usb.util.dispose_resources(self.device)
+            try:
+                if not self.device.is_kernel_driver_active(self.interface):
+                    # self.device.attach_kernel_driver(self.interface) #Do NOT uncomment
+                    self.device.attach_kernel_driver(0)
+                if reset:
+                    self.device.reset()
+            except Exception as e:  # pylint: disable=broad-except
+                self.debug(str(e))
+                pass
+            del self.device
+
+    def write(self, command):
+        pktsize=self.EP_OUT.wMaxPacketSize
+        if isinstance(command, str):
+            command = bytes(command, 'utf-8')
+        if command == b'':
+            try:
+                self.EP_OUT.write(b'')
+            except usb.core.USBError as e:
+                error = str(e.strerror)
+                if "timeout" in error:
+                    time.sleep(0.01)
+                    try:
+                        self.EP_OUT.write(b'')
+                    except Exception as e:  # pylint: disable=broad-except
+                        self.debug(str(e))
+                        return False
+                return True
+        else:
+            i = 0
+            try:
+                buffer=array.array('B',command)
+                self.EP_OUT.write(buffer)
+            except Exception as e:  # pylint: disable=broad-except
+                # print("Error while writing")
+                if "timed out" in str(e):
+                    self.debug(str(e))
+                    time.sleep(0.01)
+                    i += 1
+                    if i == 3:
+                        return False
+                    pass
+                else:
+                    self.error(str(e))
+                    return False
+        if self.loglevel == logging.DEBUG:
+            self.verify_data(bytearray(command), "TX:")
+        return True
+
+    def read(self, length=0x80, timeout=None):
+        if self.loglevel==logging.DEBUG:
+            self.debug(inspect.currentframe().f_back.f_code.co_name + ":" + hex(length))
+        tmp = bytearray()
+        extend = tmp.extend
+        if timeout is None:
+            timeout = self.timeout
+        buffer = self.buffer
+        ep_read = self.EP_IN.read
+        while len(tmp) == 0:
+            try:
+                length=ep_read(buffer, timeout)
+                extend(buffer[:length])
+                if len(tmp)>0:
+                    return tmp
+            except usb.core.USBError as e:
+                error = str(e.strerror)
+                if "timed out" in error:
+                    # if platform.system()=='Windows':
+                    # time.sleep(0.05)
+                    # print("Waiting...")
+                    self.debug("Timed out")
+                    self.debug(tmp)
+                    return tmp
+                elif "Overflow" in error:
+                    self.error("USB Overflow")
+                    sys.exit(0)
+                elif e.errno is not None:
+                    print(repr(e), type(e), e.errno)
+                    sys.exit(0)
+                else:
+                    break
+        if self.loglevel == logging.DEBUG:
+            self.verify_data(tmp, "RX:")
+        return tmp
+
+    def ctrl_transfer(self, bmrequesttype, brequest, wvalue, windex, data_or_wlength):
+        ret = self.device.ctrl_transfer(bmrequesttype=bmrequesttype, brequest=brequest, wvalue=wvalue, windex=windex,
+                                        data_or_wlength=data_or_wlength)
+        return ret[0] | (ret[1] << 8)
+
+
+class ScsiCmds(Enum):
+    SC_TEST_UNIT_READY = 0x00,
+    SC_REQUEST_SENSE = 0x03,
+    SC_FORMAT_UNIT = 0x04,
+    SC_READ_6 = 0x08,
+    SC_WRITE_6 = 0x0a,
+    SC_INQUIRY = 0x12,
+    SC_MODE_SELECT_6 = 0x15,
+    SC_RESERVE = 0x16,
+    SC_RELEASE = 0x17,
+    SC_MODE_SENSE_6 = 0x1a,
+    SC_START_STOP_UNIT = 0x1b,
+    SC_SEND_DIAGNOSTIC = 0x1d,
+    SC_PREVENT_ALLOW_MEDIUM_REMOVAL = 0x1e,
+    SC_READ_FORMAT_CAPACITIES = 0x23,
+    SC_READ_CAPACITY = 0x25,
+    SC_WRITE_10 = 0x2a,
+    SC_VERIFY = 0x2f,
+    SC_READ_10 = 0x28,
+    SC_SYNCHRONIZE_CACHE = 0x35,
+    SC_READ_TOC = 0x43,
+    SC_READ_HEADER = 0x44,
+    SC_MODE_SELECT_10 = 0x55,
+    SC_MODE_SENSE_10 = 0x5a,
+    SC_READ_12 = 0xa8,
+    SC_WRITE_12 = 0xaa,
+    SC_PASCAL_MODE = 0xff
+
+
+command_block_wrapper = [
+    ('dCBWSignature', '4s'),
+    ('dCBWTag', 'I'),
+    ('dCBWDataTransferLength', 'I'),
+    ('bmCBWFlags', 'B'),
+    ('bCBWLUN', 'B'),
+    ('bCBWCBLength', 'B'),
+    ('CBWCB', '16s'),
+]
+command_block_wrapper_len = 31
+
+command_status_wrapper = [
+    ('dCSWSignature', '4s'),
+    ('dCSWTag', 'I'),
+    ('dCSWDataResidue', 'I'),
+    ('bCSWStatus', 'B')
+]
+command_status_wrapper_len = 13
+
+
+class Scsi:
+    """
+    FIHTDC, PCtool
+    """
+    SC_READ_NV = 0xf0
+    SC_SWITCH_STATUS = 0xf1
+    SC_SWITCH_PORT = 0xf2
+    SC_MODEM_STATUS = 0xf4
+    SC_SHOW_PORT = 0xf5
+    SC_MODEM_DISCONNECT = 0xf6
+    SC_MODEM_CONNECT = 0xf7
+    SC_DIAG_RUT = 0xf8
+    SC_READ_BATTERY = 0xf9
+    SC_READ_IMAGE = 0xfa
+    SC_ENABLE_ALL_PORT = 0xfd
+    SC_MASS_STORGE = 0xfe
+    SC_ENTER_DOWNLOADMODE = 0xff
+    SC_ENTER_FTMMODE = 0xe0
+    SC_SWITCH_ROOT = 0xe1
+    """
+    //Div2-5-3-Peripheral-LL-ADB_ROOT-00+/* } FIHTDC, PCtool */
+    //StevenCPHuang 2011/08/12 porting base on 1050 --
+    //StevenCPHuang_20110820,add Moto's mode switch cmd to support PID switch function ++
+    """
+    SC_MODE_SWITCH = 0xD6
+
+    # /StevenCPHuang_20110820,add Moto's mode switch cmd to support PID switch function --
+
+    def __init__(self, loglevel=logging.INFO, vid=None, pid=None, interface=-1):
+        self.vid = vid
+        self.pid = pid
+        self.interface = interface
+        self.Debug = False
+        self.usb = None
+        self.loglevel = loglevel
+
+    def connect(self):
+        self.usb = UsbClass(loglevel=self.loglevel, portconfig=[self.vid, self.pid, self.interface], devclass=8)
+        if self.usb.connect():
+            return True
+        return False
+
+    # htcadb = "55534243123456780002000080000616687463800100000000000000000000";
+    # Len 0x6, Command 0x16, "HTC" 01 = Enable, 02 = Disable
+    def send_mass_storage_command(self, lun, cdb, direction, data_length):
+        global tag
+        cmd = cdb[0]
+        if 0 <= cmd < 0x20:
+            cdb_len = 6
+        elif 0x20 <= cmd < 0x60:
+            cdb_len = 10
+        elif 0x60 <= cmd < 0x80:
+            cdb_len = 0
+        elif 0x80 <= cmd < 0xA0:
+            cdb_len = 16
+        elif 0xA0 <= cmd < 0xC0:
+            cdb_len = 12
+        else:
+            cdb_len = 6
+
+        if len(cdb) != cdb_len:
+            print("Error, cdb length doesn't fit allowed cbw packet length")
+            return 0
+
+        if (cdb_len == 0) or (cdb_len > command_block_wrapper_len):
+            print("Error, invalid data packet length, should be max of 31 bytes.")
+            return 0
+        else:
+            data = write_object(command_block_wrapper, b"USBC", tag, data_length, direction, lun, cdb_len, cdb)[
+                'raw_data']
+            print(hexlify(data))
+            if len(data) != 31:
+                print("Error, invalid data packet length, should be 31 bytes, but length is %d" % len(data))
+                return 0
+            tag += 1
+            self.usb.write(data, 31)
+        return tag
+
+    def send_htc_adbenable(self):
+        # do_reserve from f_mass_storage.c
+        print("Sending HTC adb enable command")
+        common_cmnd = b"\x16htc\x80\x01"  # reserve_cmd + 'htc' + len + flag
+        '''
+        Flag values:
+            1: Enable adb daemon from mass_storage
+            2: Disable adb daemon from mass_storage
+            3: cancel unmount BAP cdrom
+            4: cancel unmount HSM rom
+        '''
+        lun = 0
+        datasize = common_cmnd[4]
+        timeout = 5000
+        ret_tag = self.send_mass_storage_command(lun, common_cmnd, USB_DIR_IN, datasize)
+        ret_tag += self.send_mass_storage_command(lun, common_cmnd, USB_DIR_IN, datasize)
+        if datasize > 0:
+            data = self.usb.read(datasize, timeout)
+            print("DATA: " + hexlify(data).decode('utf-8'))
+        print("Sent HTC adb enable command")
+
+    def send_htc_ums_adbenable(self):  # HTC10
+        # ums_ctrlrequest from f_mass_storage.c
+        print("Sending HTC ums adb enable command")
+        brequesttype = USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE
+        brequest = 0xa0
+        wvalue = 1
+        '''
+        wValue:
+            0: Disable adb daemon
+            1: Enable adb daemon
+        '''
+        windex = 0
+        w_length = 1
+        ret = self.usb.ctrl_transfer(brequesttype, brequest, wvalue, windex, w_length)
+        print("Sent HTC ums adb enable command: %x" % ret)
+
+    def send_zte_adbenable(self):  # zte blade
+        common_cmnd = b"\x86zte\x80\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"  # reserve_cmd + 'zte' + len + flag
+        common_cmnd2 = b"\x86zte\x80\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"  # reserve_cmd + 'zte' + len + flag
+        '''
+        Flag values:
+            0: disable adbd ---for 736T
+            1: enable adbd ---for 736T
+            2: disable adbd ---for All except 736T
+            3: enable adbd ---for All except 736T
+        '''
+        lun = 0
+        datasize = common_cmnd[4]
+        timeout = 5000
+        ret_tag = self.send_mass_storage_command(lun, common_cmnd, USB_DIR_IN, datasize)
+        ret_tag += self.send_mass_storage_command(lun, common_cmnd, USB_DIR_IN, datasize)
+        ret_tag = self.send_mass_storage_command(lun, common_cmnd2, USB_DIR_IN, datasize)
+        ret_tag += self.send_mass_storage_command(lun, common_cmnd2, USB_DIR_IN, datasize)
+        if datasize > 0:
+            data = self.usb.read(datasize, timeout)
+            print("DATA: " + hexlify(data).decode('utf-8'))
+        print("Send HTC adb enable command")
+
+    def send_fih_adbenable(self):  # motorola xt560, nokia 3.1, #f_mass_storage.c
+        if self.usb.connect():
+            print("Sending FIH adb enable command")
+            datasize = 0x24
+            # reserve_cmd + 'FI' + flag + len + none
+            common_cmnd = bytes([self.SC_SWITCH_PORT]) + b"FI1" + struct.pack("<H", datasize)
+            '''
+            Flag values:
+                common_cmnd[3]->1: Enable adb daemon from mass_storage
+                common_cmnd[3]->0: Disable adb daemon from mass_storage
+            '''
+            lun = 0
+            # datasize=common_cmnd[4]
+            timeout = 5000
+            ret_tag = None
+            ret_tag += self.send_mass_storage_command(lun, common_cmnd, USB_DIR_IN, 0x600)
+            # ret_tag+=self.send_mass_storage_command(lun, common_cmnd, USB_DIR_IN, 0x600)
+            if datasize > 0:
+                data = self.usb.read(datasize, timeout)
+                print("DATA: " + hexlify(data).decode('utf-8'))
+            print("Sent FIH adb enable command")
+            self.usb.close()
+
+    def send_alcatel_adbenable(self):  # Alcatel MW41
+        if self.usb.connect():
+            print("Sending alcatel adb enable command")
+            datasize = 0x24
+            common_cmnd = b"\x16\xf9\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+            lun = 0
+            timeout = 5000
+            ret_tag = None
+            ret_tag += self.send_mass_storage_command(lun, common_cmnd, USB_DIR_IN, 0x600)
+            if datasize > 0:
+                data = self.usb.read(datasize, timeout)
+                print("DATA: " + hexlify(data).decode('utf-8'))
+            print("Sent alcatel adb enable command")
+            self.usb.close()
+
+    def send_fih_root(self):
+        # motorola xt560, nokia 3.1, huawei u8850, huawei Ideos X6,
+        # lenovo s2109, triumph M410, viewpad 7, #f_mass_storage.c
+        if self.usb.connect():
+            print("Sending FIH root command")
+            datasize = 0x24
+            # reserve_cmd + 'FIH' + len + flag + none
+            common_cmnd = bytes([self.SC_SWITCH_ROOT]) + b"FIH" + struct.pack("<H", datasize)
+            lun = 0
+            # datasize = common_cmnd[4]
+            timeout = 5000
+            ret_tag = self.send_mass_storage_command(lun, common_cmnd, USB_DIR_IN, 0x600)
+            ret_tag += self.send_mass_storage_command(lun, common_cmnd, USB_DIR_IN, 0x600)
+            if datasize > 0:
+                data = self.usb.read(datasize, timeout)
+                print("DATA: " + hexlify(data).decode('utf-8'))
+            print("Sent FIH root command")
+            self.usb.close()
+
+    def close(self):
+        self.usb.close()
+        return True
+
+
+==================================================
+FILE: edl/Library/usbscsi.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2021
+import argparse
+from edl.Library.usblib import *
+
+
+def main():
+    info = 'MassStorageBackdoor (c) B.Kerler 2019.'
+    parser = argparse.ArgumentParser(description=info)
+    print("\n" + info + "\n\n")
+    parser.add_argument('-vid', metavar="<vid>", help='[Option] Specify vid, default=0x2e04)', default="0x2e04")
+    parser.add_argument('-pid', metavar="<pid>", help='[Option] Specify pid, default=0xc025)', default="0xc025")
+    parser.add_argument('-interface', metavar="<pid>", help='[Option] Specify interface number)', default="")
+    parser.add_argument('-nokia', help='[Option] Enable Nokia adb backdoor', action='store_true')
+    parser.add_argument('-alcatel', help='[Option] Enable alcatel adb backdoor', action='store_true')
+    parser.add_argument('-zte', help='[Option] Enable zte adb backdoor', action='store_true')
+    parser.add_argument('-htc', help='[Option] Enable htc adb backdoor', action='store_true')
+    parser.add_argument('-htcums', help='[Option] Enable htc ums adb backdoor', action='store_true')
+    args = parser.parse_args()
+    vid = None
+    pid = None
+    if args.vid != "":
+        vid = int(args.vid, 16)
+    if args.pid != "":
+        pid = int(args.pid, 16)
+    if args.interface != "":
+        interface = int(args.interface, 16)
+    else:
+        interface = -1
+
+    usbscsi = Scsi(vid, pid, interface)
+    if usbscsi.connect():
+        if args.nokia:
+            usbscsi.send_fih_adbenable()
+            usbscsi.send_fih_root()
+        elif args.zte:
+            usbscsi.send_zte_adbenable()
+        elif args.htc:
+            usbscsi.send_htc_adbenable()
+        elif args.htcums:
+            usbscsi.send_htc_ums_adbenable()
+        elif args.alcatel:
+            usbscsi.send_alcatel_adbenable()
+        else:
+            print("A command is required. Use -h to see options.")
+            exit(0)
+        usbscsi.close()
+
+
+if __name__ == '__main__':
+    main()
+
+
+==================================================
+FILE: edl/Library/utils.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2021
+import sys
+import logging
+import logging.config
+import codecs
+import struct
+import os
+import shutil
+import stat
+import colorama
+import copy
+from struct import unpack, pack
+
+try:
+    from capstone import *
+except ImportError:
+    print("Capstone library is missing (optional).")
+try:
+    from keystone import *
+except ImportError:
+    print("Keystone library is missing (optional).")
+
+
+
+
+
+class structhelper:
+    pos = 0
+
+    def __init__(self, data, pos=0):
+        self.pos = 0
+        self.data = data
+
+    def qword(self):
+        dat = unpack("<Q", self.data[self.pos:self.pos + 8])[0]
+        self.pos += 8
+        return dat
+
+    def dword(self):
+        dat = unpack("<I", self.data[self.pos:self.pos + 4])[0]
+        self.pos += 4
+        return dat
+
+    def dwords(self, dwords=1):
+        dat = unpack("<" + str(dwords) + "I", self.data[self.pos:self.pos + 4 * dwords])
+        self.pos += 4 * dwords
+        return dat
+
+    def short(self):
+        dat = unpack("<H", self.data[self.pos:self.pos + 2])[0]
+        self.pos += 2
+        return dat
+
+    def shorts(self, shorts):
+        dat = unpack("<" + str(shorts) + "H", self.data[self.pos:self.pos + 2*shorts])
+        self.pos += 2 * shorts
+        return dat
+
+    def bytes(self, rlen=1):
+        dat = self.data[self.pos:self.pos + rlen]
+        self.pos += rlen
+        if rlen == 1: return dat[0]
+        return dat
+
+    def string(self, rlen=1):
+        dat = self.data[self.pos:self.pos + rlen]
+        self.pos += rlen
+        return dat
+
+    def getpos(self):
+        return self.pos
+
+    def seek(self, pos):
+        self.pos = pos
+
+def do_tcp_server(client, arguments, handler):
+    def tcpprint(arg):
+        if isinstance(arg, bytes) or isinstance(arg, bytearray):
+            return connection.sendall(arg)
+        else:
+            return connection.sendall(bytes(str(arg), 'utf-8'))
+
+    client.printer = tcpprint
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    port = int(arguments["--tcpport"])
+    server_address = ('localhost', port)
+    print('starting up on %s port %s' % server_address)
+    sock.bind(server_address)
+    sock.listen(1)
+    response = None
+    while True:
+        print('waiting for a connection')
+        connection, client_address = sock.accept()
+        try:
+            print('connection from', client_address)
+            while True:
+                data = connection.recv(4096).decode('utf-8')
+                if data == '':
+                    break
+                print('received %s' % data)
+                if data:
+                    print('handling request')
+                    lines = data.split("\n")
+                    for line in lines:
+                        if ":" in line:
+                            cmd = line.split(":")[0]
+                            marguments = line.split(":")[1]
+                            try:
+                                opts = parse_args(cmd, marguments, arguments)
+                            except:
+                                response = "Wrong arguments\n<NAK>\n"
+                                opts = None
+                            if opts is not None:
+                                if handler(cmd, opts):
+                                    response = "<ACK>\n"
+                                else:
+                                    response = "<NAK>\n"
+                            connection.sendall(bytes(response, 'utf-8'))
+        finally:
+            connection.close()
+
+
+def parse_args(cmd, args, mainargs):
+    options = {}
+    opts = None
+    if "," in args:
+        opts = args.split(",")
+    else:
+        opts = [args]
+    for arg in mainargs:
+        if "--" in arg:
+            options[arg] = mainargs[arg]
+    if cmd == "gpt":
+        options["<directory>"] = opts[0]
+    elif cmd == "r":
+        options["<partitionname>"] = opts[0]
+        options["<filename>"] = opts[1]
+    elif cmd == "rl":
+        options["<directory>"] = opts[0]
+    elif cmd == "rf":
+        options["<filename>"] = opts[0]
+    elif cmd == "rs":
+        options["<start_sector>"] = opts[0]
+        options["<sectors>"] = opts[1]
+        options["<filename>"] = opts[2]
+    elif cmd == "w":
+        options["<partitionname>"] = opts[0]
+        options["<filename>"] = opts[0]
+    elif cmd == "wl":
+        options["<directory>"] = opts[0]
+    elif cmd == "wf":
+        options["<filename>"] = opts[0]
+    elif cmd == "ws":
+        options["<start_sector>"] = opts[0]
+        options["<filename>"] = opts[1]
+    elif cmd == "e":
+        options["<partitionname>"] = opts[0]
+    elif cmd == "es":
+        options["<start_sector>"] = opts[0]
+        options["<sectors>"] = opts[1]
+    elif cmd == "footer":
+        options["<filename>"] = opts[0]
+    elif cmd == "peek":
+        options["<offset>"] = opts[0]
+        options["<length>"] = opts[1]
+        options["<filename>"] = opts[2]
+    elif cmd == "peekhex":
+        options["<offset>"] = opts[0]
+        options["<length>"] = opts[1]
+    elif cmd == "peekdword":
+        options["<offset>"] = opts[0]
+    elif cmd == "peekqword":
+        options["<offset>"] = opts[0]
+    elif cmd == "memtbl":
+        options["<filename>"] = opts[0]
+    elif cmd == "poke":
+        options["<offset>"] = opts[0]
+        options["<filename>"] = opts[1]
+    elif cmd == "pokehex":
+        options["<offset>"] = opts[0]
+        options["<data>"] = opts[1]
+    elif cmd == "pokedword":
+        options["<offset>"] = opts[0]
+        options["<data>"] = opts[1]
+    elif cmd == "pokeqword":
+        options["<offset>"] = opts[0]
+        options["<data>"] = opts[1]
+    elif cmd == "memcpy":
+        options["<offset>"] = opts[0]
+        options["<size>"] = opts[1]
+    elif cmd == "pbl":
+        options["<filename>"] = opts[0]
+    elif cmd == "qfp":
+        options["<filename>"] = opts[0]
+    elif cmd == "setbootablestoragedrive":
+        options["<lun>"] = opts[0]
+    elif cmd == "send":
+        options["<command>"] = opts[0]
+    elif cmd == "xml":
+        options["<xmlfile>"] = opts[0]
+    elif cmd == "rawxml":
+        options["<xmlstring>"] = opts[0]
+    return options
+
+
+def getint(valuestr):
+    try:
+        return int(valuestr)
+    except:
+        try:
+            return int(valuestr, 16)
+        except:
+            return 0
+
+
+class ColorFormatter(logging.Formatter):
+    LOG_COLORS = {
+        logging.ERROR: colorama.Fore.RED,
+        logging.DEBUG: colorama.Fore.LIGHTMAGENTA_EX,
+        logging.WARNING: colorama.Fore.YELLOW,
+    }
+
+    def format(self, record, *args, **kwargs):
+        # if the corresponding logger has children, they may receive modified
+        # record, so we want to keep it intact
+        new_record = copy.copy(record)
+        if new_record.levelno in self.LOG_COLORS:
+            pad = ""
+            if new_record.name != "root":
+                print(new_record.name)
+                pad = "[LIB]: "
+            # we want levelname to be in different color, so let's modify it
+            new_record.msg = "{pad}{color_begin}{msg}{color_end}".format(
+                pad=pad,
+                msg=new_record.msg,
+                color_begin=self.LOG_COLORS[new_record.levelno],
+                color_end=colorama.Style.RESET_ALL,
+            )
+        # now we can let standart formatting take care of the rest
+        return super(ColorFormatter, self).format(new_record, *args, **kwargs)
+
+
+class LogBase(type):
+    debuglevel = logging.root.level
+
+    def __init__(cls, *args):
+        super().__init__(*args)
+        logger_attribute_name = '_' + cls.__name__ + '__logger'
+        logger_debuglevel_name = '_' + cls.__name__ + '__debuglevel'
+        logger_name = '.'.join([c.__name__ for c in cls.mro()[-2::-1]])
+        LOG_CONFIG = {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "root": {
+                    "()": ColorFormatter,
+                    "format": "%(name)s - %(message)s",
+                }
+            },
+            "handlers": {
+                "root": {
+                    # "level": cls.__logger.level,
+                    "formatter": "root",
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stdout",
+                }
+            },
+            "loggers": {
+                "": {
+                    "handlers": ["root"],
+                    # "level": cls.debuglevel,
+                    "propagate": False
+                }
+            },
+        }
+        logging.config.dictConfig(LOG_CONFIG)
+        logger = logging.getLogger(logger_name)
+
+        setattr(cls, logger_attribute_name, logger)
+        setattr(cls, logger_debuglevel_name, cls.debuglevel)
+
+
+def del_rw(action, name, exc):
+    os.chmod(name, stat.S_IWRITE)
+    os.remove(name)
+
+
+def rmrf(path):
+    if os.path.exists(path):
+        if os.path.isfile(path):
+            del_rw("", path, "")
+        else:
+            shutil.rmtree(path, onerror=del_rw)
+
+
+class elf:
+    class memorysegment:
+        phy_addr = 0
+        virt_start_addr = 0
+        virt_end_addr = 0
+        file_start_addr = 0
+        file_end_addr = 0
+
+    def __init__(self, indata, filename):
+        self.data = indata
+        self.filename = filename
+        self.header, self.pentry = self.parse()
+        self.memorylayout = []
+        for entry in self.pentry:
+            ms = self.memorysegment()
+            ms.phy_addr = entry.phy_addr
+            ms.virt_start_addr = entry.virt_addr
+            ms.virt_end_addr = entry.virt_addr + entry.seg_mem_len
+            ms.file_start_addr = entry.from_file
+            ms.file_end_addr = entry.from_file + entry.seg_file_len
+            self.memorylayout.append(ms)
+
+    def getfileoffset(self, offset):
+        for memsegment in self.memorylayout:
+            if memsegment.virt_end_addr >= offset >= memsegment.virt_start_addr:
+                return offset - memsegment.virt_start_addr + memsegment.file_start_addr
+        return None
+
+    def getvirtaddr(self, fileoffset):
+        for memsegment in self.memorylayout:
+            if memsegment.file_end_addr >= fileoffset >= memsegment.file_start_addr:
+                return memsegment.virt_start_addr + fileoffset - memsegment.file_start_addr
+        return None
+
+    def getbaseaddr(self, offset):
+        for memsegment in self.memorylayout:
+            if memsegment.virt_end_addr >= offset >= memsegment.virt_start_addr:
+                return memsegment.virt_start_addr
+        return None
+
+    class programentry:
+        p_type = 0
+        from_file = 0
+        virt_addr = 0
+        phy_addr = 0
+        seg_file_len = 0
+        seg_mem_len = 0
+        p_flags = 0
+        p_align = 0
+
+    def parse_programentry(self, dat):
+        pe = self.programentry()
+        if self.elfclass == 1:
+            (pe.p_type, pe.from_file, pe.virt_addr, pe.phy_addr, pe.seg_file_len, pe.seg_mem_len, pe.p_flags,
+             pe.p_align) = struct.unpack("<IIIIIIII", dat)
+        elif self.elfclass == 2:
+            (pe.p_type, pe.p_flags, pe.from_file, pe.virt_addr, pe.phy_addr, pe.seg_file_len, pe.seg_mem_len,
+             pe.p_align) = struct.unpack("<IIQQQQQQ", dat)
+        return pe
+
+    def parse(self):
+        self.elfclass = self.data[4]
+        if self.elfclass == 1:  # 32Bit
+            start = 0x28
+        elif self.elfclass == 2:  # 64Bit
+            start = 0x34
+        else:
+            print("Error on parsing " + self.filename)
+            return ['', '']
+        elfheadersize, programheaderentrysize, programheaderentrycount = struct.unpack("<HHH",
+                                                                                       self.data[start:start + 3 * 2])
+        programheadersize = programheaderentrysize * programheaderentrycount
+        header = self.data[0:elfheadersize + programheadersize]
+        pentry = []
+        for i in range(0, programheaderentrycount):
+            start = elfheadersize + (i * programheaderentrysize)
+            end = start + programheaderentrysize
+            pentry.append(self.parse_programentry(self.data[start:end]))
+
+        return [header, pentry]
+
+
+class patchtools:
+    cstyle = False
+    bDebug = False
+
+    def __init__(self, bdebug=False):
+        self.bDebug = bdebug
+
+    def has_bad_uart_chars(self, data):
+        badchars = [b'\x00', b'\n', b'\r', b'\x08', b'\x7f', b'\x20', b'\x09']
+        for idx, c in enumerate(data):
+            c = bytes([c])
+            if c in badchars:
+                return True
+        return False
+
+    def generate_offset(self, offset):
+        div = 0
+        found = False
+        while not found and div < 0x606:
+            data = struct.pack("<I", offset + div)
+            data2 = struct.pack("<H", div)
+            badchars = self.has_bad_uart_chars(data)
+            if not badchars:
+                badchars = self.has_bad_uart_chars(data2)
+                if not (badchars):
+                    return div
+            div += 4
+
+        # if div is not found within positive offset, try negative offset
+        div = 0
+        while not found and div < 0x606:
+            data = struct.pack("<I", offset - div)
+            data2 = struct.pack("<H", div)
+            badchars = self.has_bad_uart_chars(data)
+            if not badchars:
+                badchars = self.has_bad_uart_chars(data2)
+                if not badchars:
+                    return -div
+            div += 4
+        return 0
+
+    # Usage: offset, "X24"
+    def generate_offset_asm(self, offset, reg):
+        div = self.generate_offset(offset)
+        abase = ((offset + div) & 0xFFFF0000) >> 16
+        a = ((offset + div) & 0xFFFF)
+        strasm = ""
+        if div > 0:
+            strasm += "# " + hex(offset) + "\n"
+            strasm += "mov " + reg + ", #" + hex(a) + ";\n"
+            strasm += "movk " + reg + ", #" + hex(abase) + ", LSL#16;\n"
+            strasm += "sub  " + reg + ", " + reg + ", #" + hex(div) + ";\n"
+        else:
+            strasm += "# " + hex(offset) + "\n"
+            strasm += "mov " + reg + ", #" + hex(a) + ";\n"
+            strasm += "movk " + reg + ", #" + hex(abase) + ", LSL#16;\n"
+            strasm += "add  " + reg + ", " + reg + ", #" + hex(-div) + ";\n"
+        return strasm
+
+    def uart_valid_sc(self, sc):
+        badchars = [b'\x00', b'\n', b'\r', b'\x08', b'\x7f', b'\x20', b'\x09']
+        for idx, c in enumerate(sc):
+            c = bytes([c])
+            if c in badchars:
+                print("bad char 0x%s in SC at offset %d, opcode # %d!\n" % (codecs.encode(c, 'hex'), idx, idx / 4))
+                print(codecs.encode(sc, 'hex'))
+                return False
+        return True
+
+    def disasm(self, code, size):
+        cs = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
+        instr = []
+        for i in cs.disasm(code, size):
+            # print("0x%x:\t%s\t%s" % (i.address, i.mnemonic, i.op_str))
+            instr.append("%s\t%s" % (i.mnemonic, i.op_str))
+        return instr
+
+    def assembler(self, code):
+        ks = Ks(KS_ARCH_ARM64, KS_MODE_LITTLE_ENDIAN)
+        if self.bDebug:
+            try:
+                encoding, count = ks.asm(code)
+            except KsError as e:
+                print(e)
+                print(e.stat_count)
+                print(code[e.stat_count:e.stat_count + 10])
+                exit(0)
+                if self.bDebug:
+                    # walk every line to find the (first) error
+                    for idx, line in enumerate(code.splitlines()):
+                        print("%02d: %s" % (idx, line))
+                        if len(line) and line[0] != '.':
+                            try:
+                                encoding, count = ks.asm(line)
+                            except Exception as e:
+                                print("bummer: " + str(e))
+                else:
+                    exit(0)
+        else:
+            encoding, count = ks.asm(code)
+
+        sc = ""
+        count = 0
+        out = ""
+        for i in encoding:
+            if self.cstyle:
+                out += ("\\x%02x" % i)
+            else:
+                out += ("%02x" % i)
+            sc += "%02x" % i
+
+            count += 1
+            # if bDebug and count % 4 == 0:
+            #    out += ("\n")
+
+        return out
+
+    def find_binary(self, data, strf, pos=0):
+        t = strf.split(b".")
+        pre = 0
+        offsets = []
+        while pre != -1:
+            pre = data[pos:].find(t[0], pre)
+            if pre == -1:
+                if len(offsets) > 0:
+                    for offset in offsets:
+                        error = 0
+                        rt = offset + len(t[0])
+                        for i in range(1, len(t)):
+                            if t[i] == b'':
+                                rt += 1
+                                continue
+                            rt += 1
+                            prep = data[rt:].find(t[i])
+                            if (prep != 0):
+                                error = 1
+                                break
+                            rt += len(t[i])
+                        if error == 0:
+                            return offset
+                else:
+                    return None
+            else:
+                offsets.append(pre)
+                pre += 1
+        return None
+
+
+def read_object(data: object, definition: object) -> object:
+    """
+    Unpacks a structure using the given data and definition.
+    """
+    obj = {}
+    object_size = 0
+    pos = 0
+    for (name, stype) in definition:
+        object_size += struct.calcsize(stype)
+        obj[name] = struct.unpack(stype, data[pos:pos + struct.calcsize(stype)])[0]
+        pos += struct.calcsize(stype)
+    obj['object_size'] = object_size
+    obj['raw_data'] = data
+    return obj
+
+
+def write_object(definition, *args):
+    """
+    Unpacks a structure using the given data and definition.
+    """
+    obj = {}
+    object_size = 0
+    data = b""
+    i = 0
+    for (name, stype) in definition:
+        object_size += struct.calcsize(stype)
+        arg = args[i]
+        try:
+            data += struct.pack(stype, arg)
+        except Exception as e:
+            print("Error:" + str(e))
+            break
+        i += 1
+    obj['object_size'] = len(data)
+    obj['raw_data'] = data
+    return obj
+
+
+def print_progress(iteration, total, prefix='', suffix='', decimals=1, bar_length=100):
+    """
+    Call in a loop to create terminal progress bar
+    @params:
+        iteration   - Required  : current iteration (Int)
+        total       - Required  : total iterations (Int)
+        prefix      - Optional  : prefix string (Str)
+        suffix      - Optional  : suffix string (Str)
+        decimals    - Optional  : positive number of decimals in percent complete (Int)
+        bar_length  - Optional  : character length of bar (Int)
+    """
+    str_format = "{0:." + str(decimals) + "f}"
+    percents = str_format.format(100 * (iteration / float(total)))
+    filled_length = int(round(bar_length * iteration / float(total)))
+    bar = '█' * filled_length + '-' * (bar_length - filled_length)
+
+    sys.stdout.write('\r%s |%s| %s%s %s' % (prefix, bar, percents, '%', suffix))
+
+    if iteration == total:
+        sys.stdout.write('\n')
+    sys.stdout.flush()
+
+
+==================================================
+FILE: edl/Library/xmlparser.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2021
+import xml.etree.ElementTree as ET
+
+
+class xmlparser:
+    def getresponse(self, input):
+        lines = input.split(b"<?xml")
+        content = {}
+        for line in lines:
+            if line == b'':
+                continue
+            line = b"<?xml" + line
+            parser = ET.XMLParser(encoding="utf-8")
+            tree = ET.fromstring(line, parser=parser)
+            e = ET.ElementTree(tree).getroot()
+            for atype in e.findall('response'):
+                for field in atype.attrib:
+                    content[field] = atype.attrib[field]
+        return content
+
+    def getlog(self, input):
+        lines = input.split(b"<?xml")
+        data = []
+        for line in lines:
+            if line == b'':
+                continue
+            line = b"<?xml" + line
+            parser = ET.XMLParser(encoding="utf-8")
+            tree = ET.fromstring(line, parser=parser)
+            e = ET.ElementTree(tree).getroot()
+            for atype in e.findall('log'):
+                if 'value' in atype.attrib:
+                    data.append(atype.attrib['value'])
+        return data
+
+
+==================================================
+FILE: edl/Library/Modules/__init__.py
+==================================================
+
+
+==================================================
+FILE: edl/Library/Modules/generic.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2021
+
+import logging
+from edl.Library.utils import LogBase
+
+
+class generic(metaclass=LogBase):
+    def __init__(self, fh, serial, args, loglevel):
+        self.fh = fh
+        self.serial = serial
+        self.args = args
+        self.__logger.setLevel(loglevel)
+        self.error=self.__logger.error
+        if loglevel == logging.DEBUG:
+            logfilename = "log.txt"
+            fh = logging.FileHandler(logfilename)
+            self.__logger.addHandler(fh)
+
+    def oem_unlock(self, enable):
+        res = self.fh.detect_partition(self.args, "config")
+        if res[0]:
+            lun = res[1]
+            rpartition = res[2]
+            offsettopatch = 0x7FFFF
+            sector = rpartition.sector + (offsettopatch // self.fh.cfg.SECTOR_SIZE_IN_BYTES)
+            offset = offsettopatch % self.fh.cfg.SECTOR_SIZE_IN_BYTES
+            if enable:
+                value = 0x1
+            else:
+                value = 0x0
+            size_in_bytes = 1
+            if self.fh.cmd_patch(lun, sector, offset, value, size_in_bytes, True):
+                print(f"Patched sector {str(rpartition.sector)}, offset {str(offset)} with value {value}, " +
+                      f"size in bytes {size_in_bytes}.")
+            else:
+                print(f"Error on writing sector {str(rpartition.sector)}, offset {str(offset)} with value {value}, " +
+                      f"size in bytes {size_in_bytes}.")
+        else:
+            """
+            #define DEVICE_MAGIC "ANDROID-BOOT!"
+            #define DEVICE_MAGIC_SIZE 13
+            #define MAX_PANEL_ID_LEN 64
+            #define MAX_VERSION_LEN  64
+            #if VBOOT_MOTA
+            struct device_info
+            {
+                unsigned char magic[DEVICE_MAGIC_SIZE];
+                bool is_unlocked;
+                bool is_tampered;
+                bool is_verified;
+                bool charger_screen_enabled;
+                char display_panel[MAX_PANEL_ID_LEN];
+                char bootloader_version[MAX_VERSION_LEN];
+                char radio_version[MAX_VERSION_LEN];
+                bool is_unlock_critical;
+            };
+            #else
+            struct device_info
+            {
+                unsigned char magic[DEVICE_MAGIC_SIZE];
+                bool is_unlocked; #0x10
+                bool is_tampered; #0x14
+                bool charger_screen_enabled; #0x18
+                char display_panel[MAX_PANEL_ID_LEN];
+                char bootloader_version[MAX_VERSION_LEN];
+                char radio_version[MAX_VERSION_LEN];
+                bool verity_mode; // 1 = enforcing, 0 = logging
+                bool is_unlock_critical;
+            };
+            #endif
+            """
+            res = self.fh.detect_partition(self.args, "devinfo")
+            if res[0]:
+                lun = res[1]
+                rpartition = res[2]
+                offsettopatch1 = 0x10  # is_unlocked
+                offsettopatch2 = 0x18  # is_critical_unlocked
+                offsettopatch3 = 0x7FFE10  # zte
+                offsettopatch4 = 0x7FFE18  # zte
+                sector1, offset1 = self.fh.calc_offset(rpartition.sector, offsettopatch1)
+                sector2, offset2 = self.fh.calc_offset(rpartition.sector, offsettopatch2)
+                sector3, offset3 = self.fh.calc_offset(rpartition.sector, offsettopatch3)
+                sector4, offset4 = self.fh.calc_offset(rpartition.sector, offsettopatch4)
+                value = 0x1
+                size_in_bytes = 1
+                if self.fh.cmd_patch(lun, sector1, offset1, 0x1, size_in_bytes, True):
+                    if self.fh.cmd_patch(lun, sector2, offset2, 0x1, size_in_bytes, True):
+                        print(
+                            f"Patched sector {str(rpartition.sector)}, offset {str(offset1)} with value {value}, " +
+                            f"size in bytes {size_in_bytes}.")
+                        data = self.fh.cmd_read_buffer(lun, rpartition.sector, rpartition.sectors)
+                        if (len(data) > 0x7FFE20) and data[0x7FFE00:0x7FFE10] == b"ANDROID-BOOT!\x00\x00\x00":
+                            if self.fh.cmd_patch(lun, sector3, offset3, value, size_in_bytes, True):
+                                if self.fh.cmd_patch(lun, sector4, offset4, value, size_in_bytes, True):
+                                    print(
+                                        f"Patched sector {str(rpartition.sector)}, offset {str(offset1)} with " +
+                                        f"value {value}, size in bytes {size_in_bytes}.")
+                        return True
+                print(
+                    f"Error on writing sector {str(rpartition.sector)}, offset {str(offset1)} with value {value}, " +
+                    f"size in bytes {size_in_bytes}.")
+                return False
+            else:
+                fpartitions = res[1]
+                self.error(f"Error: Couldn't detect partition: \"devinfo\"\nAvailable partitions:")
+                for lun in fpartitions:
+                    for rpartition in fpartitions[lun]:
+                        if self.args["--memory"].lower() == "emmc":
+                            self.error("\t" + rpartition)
+                        else:
+                            self.error(lun + ":\t" + rpartition)
+
+
+==================================================
+FILE: edl/Library/Modules/init.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2021
+
+import logging
+from edl.Library.utils import LogBase
+
+try:
+    from edl.Library.Modules.generic import generic
+except ImportError as e:
+    generic = None
+    pass
+
+try:
+    from edl.Library.Modules.oneplus import oneplus
+except ImportError as e:
+    oneplus = None
+    pass
+
+try:
+    from edl.Library.Modules.xiaomi import xiaomi
+except ImportError as e:
+    xiaomi = None
+    pass
+
+class modules(metaclass=LogBase):
+    def __init__(self, fh, serial, supported_functions, loglevel, devicemodel, args):
+        self.fh = fh
+        self.args = args
+        self.serial = serial
+        self.error = self.__logger.error
+        self.supported_functions = supported_functions
+        self.__logger.setLevel(loglevel)
+        if loglevel==logging.DEBUG:
+            logfilename = "log.txt"
+            fh = logging.FileHandler(logfilename)
+            self.__logger.addHandler(fh)
+        self.options = {}
+        self.devicemodel = devicemodel
+        self.generic = None
+        try:
+            self.generic = generic(fh=self.fh, serial=self.serial, args=self.args, loglevel=loglevel)
+        except Exception as e:
+            pass
+        self.ops = None
+        try:
+            self.ops = oneplus(fh=self.fh, projid=self.devicemodel, serial=self.serial,
+                               supported_functions=self.supported_functions, args=self.args,loglevel=loglevel)
+        except Exception as e:
+            pass
+        self.xiaomi=None
+        try:
+            self.xiaomi = xiaomi(fh=self.fh)
+        except Exception as e:
+            pass
+
+    def addpatch(self):
+        if self.ops is not None:
+            return self.ops.addpatch()
+        return ""
+
+    def addprogram(self):
+        if self.ops is not None:
+            return self.ops.addprogram()
+        return ""
+
+    def edlauth(self):
+        if self.xiaomi is not None:
+            return self.xiaomi.edl_auth()
+        return True
+
+    def writeprepare(self):
+        if self.ops is not None:
+            return self.ops.run()
+        return True
+
+    def run(self, command, args):
+        args = args.split(",")
+        options = {}
+        for i in range(len(args)):
+            if "=" in args[i]:
+                option = args[i].split("=")
+                if len(option) > 1:
+                    options[option[0]] = option[1]
+            else:
+                options[args[i]] = True
+        if command=="":
+            print("Valid commands are:\noemunlock\n")
+            return False
+        if self.generic is not None and command == "oemunlock":
+            if "enable" in options:
+                enable = True
+            elif "disable" in options:
+                enable = False
+            else:
+                self.error("Unknown mode given. Available are: enable, disable.")
+                return False
+            return self.generic.oem_unlock(enable)
+        return False
+
+
+==================================================
+FILE: edl/Library/Modules/oneplus.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2021
+
+"""
+Usage:
+    oneplus.py rawxml [--projid=value] [--serial=value]
+    oneplus.py rawnewxml [--projid=value] [--ts=value] [--serial=value]
+    oneplus.py setprojmodel_verify <token> <pk> [--projid=value]
+    oneplus.py setswprojmodel_verify <token> <pk> [--projid=value] [--ts=value]
+    oneplus.py program_verify <token> <prog_token> <pk> [--projid=value]
+Options:
+    --projid=value   Set the appropriate projid  [default: 18825]
+    --serial=value   Set the appropriate serial  [default: 123456]
+    --ts=value       Set the device timestamp    [default: 1604949411]
+"""
+
+import time
+import random
+from struct import pack
+import logging
+from edl.Library.utils import LogBase
+
+try:
+    from edl.Library.cryptutils import cryptutils
+except Exception as e:
+    print(e)
+    from ..cryptutils import cryptutils
+from binascii import unhexlify, hexlify
+
+deviceconfig = {
+    # OP5, cheeseburger
+    "16859": dict(version=1, cm=None, param_mode=0),
+    # OP5t, dumpling
+    "17801": dict(version=1, cm=None, param_mode=0),
+    # OP6, enchilada
+    "17819": dict(version=1, cm=None, param_mode=0),
+    # OP6t, fajita
+    "18801": dict(version=1, cm=None, param_mode=0),
+    # OP6t T-Mo, fajitat
+    "18811": dict(version=1, cm=None, param_mode=0),
+    # Oneplus 7, guacamoleb
+    "18857": dict(version=1, cm=None, param_mode=0),
+    # Oneplus 7 Pro, guacamole
+    "18821": dict(version=1, cm=None, param_mode=0),
+    # Oneplus 7 Pro 5G Sprint, guacamoles
+    "18825": dict(version=1, cm=None, param_mode=0),
+    # Oneplus 7 Pro 5G EE and Elisa, guacamoleg
+    "18827": dict(version=1, cm=None, param_mode=0),
+    # Oneplus 7 Pro T-Mo, guacamolet
+    "18831": dict(version=1, cm=None, param_mode=0),
+    # Oneplus 7t, hotdogb
+    "18865": dict(version=1, cm=None, param_mode=0),
+    # Oneplus 7t T-Mo, hotdogt
+    "19863": dict(version=1, cm=None, param_mode=0),
+    # Oneplus 7t Pro, hotdog
+    "19801": dict(version=1, cm=None, param_mode=0),
+    # Oneplus 7t Pro 5G T-Mo, hotdogg
+    "19861": dict(version=1, cm=None, param_mode=0),
+
+    # OP8, instantnoodle
+    "19821": dict(version=2, cm="0cffee8a", param_mode=0),
+    # OP8 T-Mo, instantnoodlet
+    "19855": dict(version=2, cm="6d9215b4", param_mode=0),
+    # OP8 Verizon, instantnoodlev
+    "19867": dict(version=2, cm="4107b2d4", param_mode=0),
+    # OP8 Visible, instantnoodlevis
+    "19868": dict(version=-1, cm="178d8213", param_mode=0),
+    # OP8 Pro, instantnoodlep
+    "19811": dict(version=2, cm="40217c07", param_mode=0),
+    # OP8t, kebab
+    "19805": dict(version=2, cm="1a5ec176", param_mode=0),
+    # OP8t T-Mo, kebabt
+    "20809": dict(version=2, cm="d6bc8c36", param_mode=0),
+
+    # OP Nord, avicii
+    "20801": dict(version=2, cm="eacf50e7", param_mode=0),
+    # OP N10 5G Metro, billie8t
+    "20885": dict(version=3, cm="3a403a71", param_mode=1),
+    # OP N10 5G Global, billie8
+    "20886": dict(version=3, cm="b8bd9e39", param_mode=1),
+    # billie8t, OP N10 5G TMO
+    "20888": dict(version=3, cm="142f1bd7", param_mode=1),
+    # OP N10 5G Europe, billie8
+    "20889": dict(version=3, cm="f2056ae1", param_mode=1),
+
+    # OP N100 Metro, billie2t
+    "20880": dict(version=3, cm="6ccf5913", param_mode=1),
+    # OP N100 Global, billie2 
+    "20881": dict(version=3, cm="fa9ff378", param_mode=1),
+    # OP N100 TMO, billie2t
+    "20882": dict(version=3, cm="4ca1e84e", param_mode=1),
+    # OP N100 Europe, billie2
+    "20883": dict(version=3, cm="ad9dba4a", param_mode=1),
+
+    # OP9 Pro, lemonadep
+    "19815": dict(version=2, cm="9c151c7f", param_mode=0),
+    "20859": dict(version=2, cm="9c151c7f", param_mode=0),
+    # OP9, lemonade
+    "19825": dict(version=2, cm="0898dcd6", param_mode=1),
+    # OP9R, lemonades
+    "20828": dict(version=2, cm=None, param_mode=1),
+    # OP9 TMO, lemonadet
+    "20854": dict(version=2, cm="16225d4e", param_mode=1),
+    # OP9 Pro TMO, lemonadept
+    "2085A": dict(version=2, cm="7f19519a", param_mode=1),
+
+    # dre8t
+    "20818": dict(version=2, cm=None, param_mode=1),
+    # dre8m
+    "2083C": dict(version=2, cm=None, param_mode=1),
+    # dre9
+    "2083D": dict(version=2, cm=None, param_mode=1)
+}
+
+
+class oneplus(metaclass=LogBase):
+    def __init__(self, fh, projid="18825", serial=123456, ATOBuild=0, Flash_Mode=0, cf=0, supported_functions=None,
+                 args=None, loglevel=logging.INFO):
+        self.fh = fh
+        self.__logger=self.__logger
+        self.args = args
+        self.ATOBuild = ATOBuild
+        self.Flash_Mode = Flash_Mode
+        self.cf = cf  # CustFlag
+        self.supported_functions = supported_functions
+        self.__logger.setLevel(loglevel)
+        self.info = self.__logger.info
+        self.debug = self.__logger.debug
+        self.error = self.__logger.error
+        if projid == "":
+            res = self.fh.detect_partition(arguments=args, partitionname="param")
+            if res[0]:
+                lun = res[1]
+                rpartition = res[2]
+                data = self.fh.cmd_read_buffer(lun, rpartition.sector, 1, False)
+                value = data[24:24 + 5]
+                try:
+                    test = int(value.decode('utf-8'))
+                    self.info("Oneplus protection with prjid %d detected" % test)
+                    projid = value.decode('utf-8')
+                except:
+                    pass
+
+        if loglevel == logging.DEBUG:
+            logfilename = "log.txt"
+            filehandler = logging.FileHandler(logfilename)
+            self.__logger.addHandler(filehandler)
+        self.ops_parm = None
+        self.ops = self.convert_projid(fh, projid, serial)
+
+    def getprodkey(self, projid):
+        if projid in ["18825", "18801"]:  # key_guacamoles, fajiita
+            prodkey = "b2fad511325185e5"
+        else:  # key_op7t/op8/N10
+            prodkey = "7016147d58e8c038"
+        return prodkey
+
+    def convert_projid(self, fh, projid, serial):
+        prodkey = self.getprodkey(projid)
+        pk = ""
+        val = bytearray(b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+        for i in range(0, 16):
+            rand = int(random.randint(0, 0x100))
+            nr = (rand & 0xFF) % 0x3E
+            pk += chr(val[nr])
+
+        if projid in deviceconfig:
+            version = deviceconfig[projid]["version"]
+            cm = deviceconfig[projid]["cm"]
+            if version == 1:
+                return oneplus1(fh, projid, serial, pk, prodkey, self.cf)
+            elif version == 2:
+                if cm is not None:
+                    return oneplus1(fh, cm, serial, pk, prodkey, self.cf)
+                else:
+                    assert "Device is not supported"
+                    exit(0)
+            elif version == 3:
+                if cm is not None:
+                    oneplus2(fh, cm, serial, pk, prodkey, self.ATOBuild, self.Flash_Mode, self.cf)
+                else:
+                    assert "Device is not supported"
+                    exit(0)
+        return None
+
+    def run(self):
+        if self.ops is not None:
+            if "demacia" in self.supported_functions:
+                if not self.ops.run("demacia"):
+                    exit(0)
+            if "SetNetType" in self.supported_functions:
+                self.fh.cmd_send(f"SetNetType")
+            elif "setprojmodel" in self.supported_functions:
+                if not self.ops.run(""):
+                    exit(0)
+            if "setprocstart" in self.supported_functions:
+                if not self.ops.run(""):
+                    exit(0)
+        return True
+
+    def setprojmodel_verify(self, pk, token):
+        if self.ops.setprojmodel_verify:
+            return self.ops.setprojmodel_verify(pk, token)
+
+    def setswprojmodel_verify(self, pk, token, device_timestamp):
+        if self.ops.setswprojmodel_verify:
+            return self.ops.setswprojmodel_verify(pk, token, device_timestamp)
+
+    def program_verify(self, pk, token, tokendata):
+        if self.ops.program_verify:
+            return self.ops.program_verify(pk, token, tokendata)
+
+    def generatetoken(self, program=False, device_timestamp="123456789"):
+        return self.ops.generatetoken(program=program, device_timestamp=device_timestamp)
+
+    def demacia(self):
+        if self.ops.demacia():
+            return self.ops.demacia()
+
+    def enable_ops(self, data, enable, projid, serial):
+        return None
+
+    def addpatch(self):
+        if "setprojmodel" in self.supported_functions or "setswprojmodel" in self.supported_functions:
+            pk, token = self.ops.generatetoken(True)
+            return f"pk=\"{pk}\" token=\"{token}\" "
+        else:
+            return ""
+
+    def addprogram(self):
+        if "setprojmodel" in self.supported_functions or "setswprojmodel" in self.supported_functions:
+            pk, token = self.ops.generatetoken(True)
+            return f"pk=\"{pk}\" token=\"{token}\" "
+        else:
+            return ""
+
+
+class oneplus1:
+    def __init__(self, fh, ModelVerifyPrjName="18825", serial=123456, pk="", prodkey="", cf=0):
+        self.pk = pk
+        self.prodkey = prodkey
+        self.ModelVerifyPrjName = ModelVerifyPrjName
+        self.fh = fh
+        self.random_postfix = "8MwDdWXZO7sj0PF3"
+        self.Version = "guacamoles_21_O.22_191107"
+        self.cf = str(cf)
+        self.soc_sn = str(serial)
+
+    def crypt_token(self, data, pk, decrypt=False, demacia=False):
+        aes = cryptutils().aes()
+        if demacia:
+            aeskey = b"\x01\x63\xA0\xD1\xFD\xE2\x67\x11" + bytes(pk, 'utf-8') + b"\x48\x27\xC2\x08\xFB\xB0\xE6\xF0"
+            aesiv = b"\x96\xE0\x79\x0C\xAE\x2B\xB4\xAF\x68\x4C\x36\xCB\x0B\xEC\x49\xCE"
+        else:
+            aeskey = b"\x10\x45\x63\x87\xE3\x7E\x23\x71" + bytes(pk, 'utf-8') + b"\xA2\xD4\xA0\x74\x0f\xD3\x28\x96"
+            aesiv = b"\x9D\x61\x4A\x1E\xAC\x81\xC9\xB2\xD3\x76\xD7\x49\x31\x03\x63\x79"
+        if decrypt:
+            cdata = unhexlify(data)
+            result = aes.aes_cbc(aeskey, aesiv, cdata)
+            result = result.rstrip(b'\x00')
+            if result[:16] == b"907heavyworkload":
+                return result
+            else:
+                return result.decode('utf-8').split(',')
+        else:
+            if not demacia:
+                while len(data) < 256:
+                    data += "\x00"
+                pdata = bytes(data, 'utf-8')
+            else:
+                while len(data) < 256:
+                    data += b"\x00"
+                pdata = data
+            result = aes.aes_cbc(aeskey, aesiv, pdata, False)
+            rdata = hexlify(result)
+            return rdata.upper().decode('utf-8')
+
+    def cmd_setpro(self):
+        pk, token = self.generatetoken(False)
+        data = "<?xml version=\"1.0\" ?>\n<data>\n<setprojmodel token=\"" + token + "\" pk=\"" + pk + "\" />\n</data>"
+        return data
+
+    def cmd_dem(self):
+        pk, token = self.demacia()
+        data = "<?xml version=\"1.0\" ?>\n<data>\n<demacia token=\"" + token + "\" pk=\"" + pk + "\" />\n</data>"
+        return data
+
+    def generatetoken(self, program=False, device_timestamp=None):
+        timestamp = str(int(time.time()))
+        ha = cryptutils().hash()
+        h1 = self.prodkey + self.ModelVerifyPrjName + self.random_postfix
+        ModelVerifyHashToken = hexlify(ha.sha256(bytes(h1, 'utf-8'))).decode('utf-8').upper()
+        # ModelVerifyPrjName=0x1C [0]
+        # random_postfix=0x2D [1]
+        # verify_hash=0x3E [2] Len:0x41
+        # ver=0x90 [3]
+        # cf=0x4 [4]
+        # sn=0x14 [5]
+        # ts=0x7f [6] Len:0x11
+        # secret=0xd1 (hash store) [7], len:0x41
+        # 0x7, Len:0x11
+        # 0x24, Len:0x41
+        #                         0x1c              0x4       0x14      0x90       0x7f        ModelVerifyHashToken
+        h2 = "c4b95538c57df231" + self.ModelVerifyPrjName + self.cf + self.soc_sn + self.Version + \
+             timestamp + ModelVerifyHashToken + "5b0217457e49381b"
+        secret = hexlify(ha.sha256(bytes(h2, 'utf-8'))).decode('utf-8').upper()  # 0xd1
+        if program:
+            items = [timestamp, secret]
+        else:
+            items = [self.ModelVerifyPrjName, self.random_postfix, ModelVerifyHashToken, self.Version, self.cf,
+                     self.soc_sn, timestamp, secret]
+        data = ""
+        for item in items:
+            data += item + ","
+        data = data[:-1]
+        token = self.crypt_token(data, self.pk)
+        return self.pk, token
+
+    def setprojmodel_verify(self, pk, token):
+        self.pk = pk
+        ha = cryptutils().hash()
+        items = self.crypt_token(token, pk, True, False)
+        info = ["Projid", "ModelVerifyHashToken", "Hash1", "FirmwareString", "CustFlag", "SOC_Serial", "Timestamp",
+                "secret"]
+        i = 0
+        print()
+        if len(info) == len(items):
+            for item in items:
+                print(info[i] + "=" + item)
+                i += 1
+        # Old
+        # 0=ModelVerifyPrjName [param+0x1C]
+        # 1=random_postfix [param+0x2D]
+        # 2=hash(key+0+1) [ModelVerifyHashToken param+0x3E]
+        # 3=ver [param_1+0x90]
+        # 4=cf [param_1+4]
+        # 5=serial? [param_1+0x14]
+        # 6=timestamp [param_1+0x7F]
+
+        hash1 = self.prodkey + items[0] + items[1]
+        res1 = hexlify(ha.sha256(bytes(hash1, 'utf-8'))).decode('utf-8').upper()
+        if items[2] != res1:
+            print("Hash1 failed !")
+            return
+        #                             ModelVerifyPrjName cf         sn         ver        ts         ModelVerifyHashToken
+        secret = "c4b95538c57df231" + items[0] + items[4] + items[5] + items[3] + items[6] + \
+                 items[2] + "5b0217457e49381b"
+        res2 = hexlify(ha.sha256(bytes(secret, 'utf-8'))).decode('utf-8').upper()
+        if items[7] != res2:
+            print("secret failed !")
+            return
+        print("setprojmodel good")
+        return items
+
+    def toSigned32(self, n):
+        n = n & 0xffffffff
+        return (n ^ 0x80000000) - 0x80000000
+
+    def demacia(self):
+        """
+        return "<?xml version=\"1.0\" ?>\n<data>\n  " + \
+               "<program SECTOR_SIZE_IN_BYTES=\"4096\" filename=\"param.bin\" " + \
+               "num_partition_sectors=\"256\" partofsingleimage=\"0\" physical_partition_number=\"0\" " + \
+               "read_back_verify=\"1\" start_sector=\"8456\" token=\""+token+"\" pk=\""+pk+"\" />\n</data>"
+        """
+        ha = cryptutils().hash()
+        serial = self.soc_sn
+        while len(serial) < 10:
+            serial = '0' + serial
+        hash1 = "2e7006834dafe8ad" + serial + "a6674c6b039707ff"
+        data = b"907heavyworkload" + ha.sha256(bytes(hash1, 'utf-8'))
+        token = self.crypt_token(data, self.pk, False, True)
+        return self.pk, token
+
+    def run(self, flag):
+        if flag == "demacia":
+            pk, token = self.demacia()
+            res = self.fh.cmd_send(f"demacia token=\"{token}\" pk=\"{pk}\"")
+            if b"verify_res=\"0\"" not in res:
+                print("Demacia failed:")
+                print(res)
+                return False
+        pk, token = self.generatetoken(False)
+        res = self.fh.cmd_send(f"setprojmodel token=\"{token}\" pk=\"{pk}\"")
+        if b"model_check=\"0\"" not in res or b"auth_token_verify=\"0\"" not in res:
+            print("Setprojmodel failed.")
+            print(res)
+            return False
+        return True
+
+    def program_verify(self, pk, token, tokendata):
+        print()
+        self.pk = pk
+        items = self.crypt_token(token, pk, True, False)
+        if len(items) == 2:
+            print("Timestamp=" + items[0])
+            print("secret=" + items[1])
+        if items[0] != tokendata[6] or items[1] != tokendata[7]:
+            print("Hash failed !")
+            return
+        print("program good")
+
+
+class oneplus2(metaclass=LogBase):
+    def __init__(self, fh, ModelVerifyPrjName="20889", serial=123456, pk="", prodkey="", ATOBuild=0, Flash_Mode=0,
+                 cf=0, loglevel=logging.INFO):
+        self.ModelVerifyPrjName = ModelVerifyPrjName
+        self.pk = pk
+        self.fh = fh
+        self.prodkey = prodkey
+        self.random_postfix = "c75oVnz8yUgLZObh"  # ModelVerifyRandom
+        self.Version = "billie8_14_E.01_201028"  # Version
+        self.device_id = str(int(ModelVerifyPrjName, 16))
+        self.flash_mode = str(Flash_Mode)
+        self.ato_build_state = str(ATOBuild)
+        self.soc_sn = str(serial)
+        self.__logger.setLevel(loglevel)
+        if loglevel == logging.DEBUG:
+            logfilename = "log.txt"
+            fh = logging.FileHandler(logfilename)
+            self.__logger.addHandler(fh)
+
+    def crypt_token(self, data, pk, device_timestamp, decrypt=False):
+        aes = cryptutils().aes()
+        aeskey = b"\x46\xA5\x97\x30\xBB\x0D\x41\xE8" + bytes(pk, 'utf-8') + \
+                 pack("<Q", int(device_timestamp, 10))  # we get this using setprocstart
+        aesiv = b"\xDC\x91\x0D\x88\xE3\xC6\xEE\x65\xF0\xC7\x44\xB4\x02\x30\xCE\x40"
+        if decrypt:
+            cdata = unhexlify(data)
+            result = aes.aes_cbc(aeskey, aesiv, cdata)
+            result = result.rstrip(b'\x00')
+            return result.decode('utf-8').split(',')
+        else:
+            while len(data) < 0x200:
+                data += "\x00"
+            pdata = bytes(data, 'utf-8')
+            result = aes.aes_cbc(aeskey, aesiv, pdata, False)
+            rdata = hexlify(result)
+            return rdata.upper().decode('utf-8')
+
+    def generatetoken(self, program=False, device_timestamp=None):  # setswprojmodel
+        timestamp = str(int(time.time()))
+        ha = cryptutils().hash()
+        h1 = self.prodkey + self.ModelVerifyPrjName + self.random_postfix
+        ModelVerifyHashToken = hexlify(ha.sha256(bytes(h1, 'utf-8'))).decode('utf-8').upper()
+        #    0x1c[0x10]        0x4           0x90       0x7f        0x3e ModelVerifyHashToken/verify_hash
+        h2 = self.prodkey + self.ModelVerifyPrjName + self.soc_sn + self.Version + timestamp + \
+             ModelVerifyHashToken + "8f7359c8a2951e8c"
+        secret = hexlify(ha.sha256(bytes(h2, 'utf-8'))).decode('utf-8').upper()
+        if program:
+            items = [timestamp, secret]
+        else:  # 0x1C[0x10]              0x2D[0x11]          0x3E[0x41]           0x10[0x4]
+            # 0x14[0x4]       0x90[0x40]   0x4[0x4]   0x114[0x4] 0x7F[0x10] 0xD1[0x41]
+            items = [self.ModelVerifyPrjName, self.random_postfix, ModelVerifyHashToken, self.ato_build_state,
+                     self.flash_mode, self.Version, self.soc_sn, self.device_id, timestamp, secret]
+        data = ""
+        for item in items:
+            data += item + ","
+        data = data[:-1]
+        token = self.crypt_token(data, self.pk, device_timestamp)
+        return self.pk, token
+
+    def run(self, flag):
+        res = self.fh.cmd_send(f"setprocstart")
+        if not b"device_timestamp" in res:
+            print("Setprocstart failed.")
+            print(res.decode('utf-8'))
+            return False
+        data = res.decode('utf-8')
+        device_timestamp = data[data.rfind("device_timestamp"):].split("\"")[1]
+        pk, token = self.generatetoken(False, device_timestamp)
+        res = self.fh.cmd_send(f"setswprojmodel token=\"{token}\" pk=\"{pk}\"")
+        if not b"model_check=\"0\"" in res or not b"auth_token_verify=\"0\"" in res:
+            print("Setswprojmodel failed.")
+            print(res.decode('utf-8'))
+            return False
+        return True
+
+    def setswprojmodel_verify(self, pk, token, device_timestamp):
+        self.pk = pk
+        ha = cryptutils().hash()
+        items = self.crypt_token(token, pk, device_timestamp, True)
+        info = ["ModelVerifyPrjName", "random_postfix", "ModelVerifyHashToken", "ato_build_state", "flash_mode",
+                "Version", "soc_sn", "cf", "timestamp", "secret"]
+        i = 0
+        print()
+        if len(info) == len(items):
+            for item in items:
+                print(info[i] + "=" + item)
+                i += 1
+
+        # New
+        # 0=ModelVerifyPrjName [param+0x1C]
+        # 1=random_postfix [param+0x2D]
+        # 2=hash [param_1+0xd1]
+        # 3=[ATO Build state param+0x3E]
+        # 4=[flash mode param_1+0x10]
+        # 5=[img ver param+0x14]
+        # 6=soc sn [param_1+0x90]
+        # 7=cf [param_1+4]
+        # 8=timestamp [param_1+0x114]
+        # 9=secret [param_1+0x7f]
+
+        hash1 = self.prodkey + items[0] + items[1]
+        res1 = hexlify(ha.sha256(bytes(hash1, 'utf-8'))).decode('utf-8').upper()
+        if items[2] != res1:
+            print("Hash1 failed !")
+            return
+        #                   ModelVerifyPrjName sn     ver        ts         ModelVerifyHashToken
+        secret = self.prodkey + items[0] + items[6] + items[5] + items[8] + items[2] \
+                 + "8f7359c8a2951e8c"
+        # h2 = self.prodkey + self.ModelVerifyPrjName + self.soc_sn + self.Version + timestamp +
+        # ModelVerifyHashToken + "8f7359c8a2951e8c"
+        res2 = hexlify(ha.sha256(bytes(secret, 'utf-8'))).decode('utf-8').upper()
+        if items[9] != res2:
+            print("secret failed !")
+            return
+        print("setswprojmodel good")
+        return items
+
+
+def main():
+    from docopt import docopt
+    args = docopt(__doc__, version='oneplus 1.2')
+    # filename="param_jacob_7pro.bin"
+    # filename="chris/param.bin"
+    if args["rawxml"]:
+        projid = args["--projid"][0]
+        serial = args["--serial"]
+        op = oneplus(None, projid=projid, serial=serial)
+        # 18831 2799496336,2799496336
+        # 18825
+        # 18857 7 Europe
+        pk, token = op.demacia()
+        print(
+            f"./edl.py rawxml \"<?xml version=\\\"1.0\\\" ?><data><demacia " +
+            f"token=\\\"{token}\\\" pk=\\\"{pk}\\\" /></data>\"")
+        pk, token = op.generatetoken(False)
+        print(
+            f"./edl.py rawxml \"<?xml version=\\\"1.0\\\" ?><data><setprojmodel " +
+            f"token=\\\"{token}\\\" pk=\\\"{pk}\\\" /></data>\" --debugmode")
+    elif args["rawnewxml"]:
+        serial = args["--serial"]
+        device_timestamp = args["--ts"]
+        op2 = oneplus(None, projid="20889", serial=serial, ATOBuild=0, Flash_Mode=0, cf=0)
+        # 20889 OP N10 5G Europe
+        print(f"./edl.py rawxml \"<?xml version=\\\"1.0\\\" ?><data><setprocstart /></data>\"")
+        # Response should be : <?xml version="1.0" ?><data><response value=1 device_timestamp="%llu" /></data>
+        pk, token = op2.generatetoken(False, device_timestamp)
+        print(
+            f"./edl.py rawxml \"<?xml version=\\\"1.0\\\" ?><data><setswprojmodel " +
+            f"token=\\\"{token}\\\" pk=\\\"{pk}\\\" /></data>\" --debugmode")
+    elif args["setprojmodel_verify"]:
+        projid = args["--projid"][0]
+        op = oneplus(None, projid=projid, serial=123456)
+        token = args["<token>"]
+        pk = args["<pk>"]
+        # setprojmodel_verify 2BA77B345812E4E45DDB5E407CF9B0F20BCD3E4F0C504A86A3DAA7D70643D0D86F4F5DAEE99E21093D26FF8A8A
+        #                     7C2CCFED387FA4C7D3BC6D8B8C2CC2D27D398886FC150C98CDC521699568C4A419D7E2F2C1A33F6B57AA7CCB5F
+        #                     39D69BB87463986B2CADDD55A41F0F9404C3FB08B0325BFDFCFDE05D1D8314D22F39979A289505D5050D854092
+        #                     CFC9FA3C101A267DD3ECA0442BF89066365ABA6607D43743D86B47B228BAAC5538B622644D74FD4049BE37C520
+        #                     76DE1B4BFE75187A7B0EE88E6C26E106570B8C0541C4693878BE9B23DEB8E4C530CFBFE9F25597FA3A86223711
+        #                     2CAF77F0D1EA4CC41EB201FFAE31036FC9E405BABAE43DE9C7E56FE1DC8E82 KHaJV1TfN45ofeLW 18865
+        # setprojmodel_verify 633B7E2BBE68BAC392B3E10FC8FEAC09F152853805A6D91FAADDE5A631C7B5A6081C6156F7344BDF407ABF7598
+        #                     0A9E6DA96964D472FE94311FEAADF6A9032C623A1C5D5B9BDD68C5E049F13DF9D893422C1A44047B1AC8E05A0A
+        #                     2A942B15B409A933A06BAB09F41FB0A3A5C8FEB86B98D39739FA4E2ABDF471DE181646F7AA228C6EC81DB3BAF2
+        #                     F2C3B5381FC9A722F9D11B6A101CAAE31ACD873B83B39AC07B7603EAA38B13F5D0B5E8F9236FB94B967AECE278
+        #                     FEA280E9330636F7C6C72C36A6040F6B8BC3C56AEC9CB0C07360E14EA83D2F6DEC4613FA74D79C325A320B88F2
+        #                     BF025CF9CE528E13169BA255E68909D7E902CE494B49514F6F57713D6F46BE Tgu1kbDW3NemNNqn 18831
+        op.setprojmodel_verify(pk, token)
+    elif args["program_verify"]:
+        projid = args["--projid"][0]
+        op = oneplus(None, projid=projid)
+        token = args["<token>"]
+        prog_token = args["<prog_token>"]
+        pk = args["<pk>"]
+        items = op.setprojmodel_verify(pk, token)
+        op.program_verify(pk, prog_token, items)
+    elif args["setswprojmodel_verify"]:
+        projid = args["--projid"][0]
+        device_timestamp = args["--ts"]
+        op = oneplus(None, projid=projid, serial=123456)
+        token = args["<token>"]
+        pk = args["<pk>"]
+        op.setswprojmodel_verify(pk, token, device_timestamp)
+
+
+def test_setswprojmodel_verify():
+    deviceresp = b"RX:<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\nRX:<data>\nRX:<response value=\"ACK\" " + \
+                 b"device_timestamp=\"2507003650\" /></data>\n<?xmlversion=\"1.0\" ? ><data><setprocstart /></data>"
+    projid = "20889"
+    op = oneplus(None, projid=projid, serial=123456)
+    data = deviceresp.decode('utf-8')
+    device_timestamp = data[data.rfind("device_timestamp"):].split("\"")[1]
+    pk, token = op.generatetoken(False, device_timestamp)
+    if not op.setswprojmodel_verify(pk, token, device_timestamp):
+        assert "Setswprojmodel error"
+
+
+if __name__ == "__main__":
+    main()
+
+
+==================================================
+FILE: edl/Library/Modules/xiaomi.py
+==================================================
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2018-2021
+
+import logging
+from edl.Library.utils import LogBase
+
+
+class xiaomi(metaclass=LogBase):
+    def __init__(self, fh, projid="18825", serial=123456, ATOBuild=0, Flash_Mode=0, cf=0, supported_functions=None,
+                 loglevel=logging.INFO):
+        self.fh = fh
+        self.xiaomi_authdata = b"\x93\x6E\x3A\x8E\x57\x3C\xAD\x07\xC1\x67\x64\x4B\x61\x21\x78\x35\xD8\x5A\xD4\xFD" + \
+                               b"\xDB\x7D\x84\x0A\x2B\x72\x25\x43\x2F\xCD\xA1\x3A\x7C\x19\x2C\xFA\x97\x9E\xD1\x65" + \
+                               b"\x17\xE6\x97\x0B\x1B\x07\xDF\x6C\x51\x6F\xEC\x81\xF6\x96\x8F\xCF\x7F\xFD\xDB\xC3" + \
+                               b"\x97\xA1\x62\xC2\xCA\x3E\x5D\x76\x12\x4A\xA1\x76\x9F\x1B\x21\x64\xB3\x9B\x76\x93" + \
+                               b"\x0B\x4C\xC6\x75\x19\xF7\xF3\x39\x87\x76\x77\xF4\xE8\xAF\x25\x82\x86\x82\xBC\xBF" + \
+                               b"\x4E\x59\x3A\x57\xE7\xE3\x05\x32\x69\x92\x53\xE0\xB1\xCC\x5D\x9D\x0D\x55\x4A\xF2" + \
+                               b"\xBD\x46\xD5\x6F\x18\xD6\xE5\x29\x0B\xA4\xA0\xCA\xC2\x43\x1F\x9F\x19\xC4\xC1\xA3" + \
+                               b"\x9D\x76\x64\xFF\xAB\x48\xA9\xE1\x1A\x55\x93\x86\x81\x98\x35\xB8\x4D\xF5\x67\x5E" + \
+                               b"\x70\xD2\x5F\xDB\x51\x23\xE7\xB0\x40\xFE\x21\x10\x8F\x0A\xE6\xD7\xD9\xD2\x67\xF2" + \
+                               b"\xC9\xC6\x1A\xD0\x54\xC6\x84\x93\xDC\x4D\x33\xF7\x4D\x0C\xF2\xD4\xAA\xDC\xD4\x30" + \
+                               b"\x15\x2D\xB6\x7C\x22\xA1\x81\xAD\x6D\x77\x61\x63\x7F\x70\xCB\xDA\x88\x4C\xDC\x11" + \
+                               b"\x33\x72\x03\x83\x77\x90\xE6\x84\x5C\xA5\xA8\x76\x79\x30\xB9\xC2\x6F\xDA\x71\x27" + \
+                               b"\x25\x64\xCA\x34\x76\x3D\x35\x2F\x5F\xE4\x2A\xB7\x38\xFB\x38\xA5"
+        self.__logger.setLevel(loglevel)
+        if loglevel == logging.DEBUG:
+            logfilename = "log.txt"
+            fh = logging.FileHandler(logfilename)
+            self.__logger.addHandler(fh)
+
+    def edl_auth(self):
+        """
+        Poco F1, Redmi 5 Pro, 6 Pro, 7 Pro, 7A, 8, 8A, 8A Dual, 8A Pro, Y2, S2
+        """
+        authcmd = b"<?xml version=\"1.0\" ?><data> <sig TargetName=\"sig\" size_in_bytes=\"256\" verbose=\"1\"/></data>"
+        rsp = self.fh.xmlsend(authcmd)
+        if rsp[0]:
+            rsp = self.fh.xmlsend(self.xiaomi_authdata)
+            if len(rsp) > 1:
+                if rsp[0]:
+                    if b"EDL Authenticated" in rsp[2] or b"ACK" in rsp[2]:
+                        return True
+            return True
+        return False
+
+
+==================================================
+FILE: edl/Windows/__init__.py
+==================================================
+
+
+==================================================
+FILE: modem/boottodwnload.py
+==================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2020 under MIT license
+# If you use my code, make sure you refer to my name
+# If you want to use in a commercial product, ask me before integrating it
+import time
+import serial
+import serial.tools.list_ports
+import argparse
+import requests
+from telnetlib import Telnet
+import usb.core
+from enum import Enum
+from diag import qcdiag
+try:
+    from Library.utils import LogBase
+except Exception as e:
+    import os,sys,inspect
+    current_dir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
+    parent_dir = os.path.dirname(current_dir)
+    sys.path.insert(0, parent_dir)
+    from Library.utils import LogBase
+
+class vendor(Enum):
+    sierra = 0x1199
+    quectel = 0x2c7c
+    zte = 0x19d2
+    netgear = 0x0846
+    telit = 0x413c
+
+class deviceclass:
+    vid=0
+    pid=0
+    def __init__(self,vid,pid):
+        self.vid=vid
+        self.pid=pid
+
+
+class connection(metaclass=LogBase):
+    def __init__(self, port=""):
+        self.serial = None
+        self.tn = None
+        self.connected = False
+        if port == "":
+            port = self.detect(port)
+            if port == "":
+                try:
+                    self.tn = Telnet("192.168.1.1", 5510, 5)
+                    self.connected = True
+                except:
+                    self.connected = False
+        if port != "":
+            self.serial = serial.Serial(port=port, baudrate=115200, bytesize=8, parity='N', stopbits=1, timeout=1)
+            self.connected = self.serial.is_open
+
+    def waitforusb(self,vid,pid):
+        timeout = 0
+        while timeout < 10:
+            for device in self.detectusbdevices():
+                if device.vid == vid:
+                    if device.pid == pid:
+                        return True
+            time.sleep(1)
+            timeout += 1
+        return False
+
+    def websend(self,url):
+        headers = {'Referer': 'http://192.168.0.1/index.html', 'Accept-Charset': 'UTF-8'}
+        r = requests.get(url, headers=headers)
+        if b"FACTORY:ok" in r.content or b"success" in r.content:
+            print(f"Detected a ZTE in web mode .... switching mode success (convert back by sending \"AT+ZCDRUN=F\" via AT port)")
+            return self.waitforusb(vendor.zte.value,0x0016)
+        return False
+
+    def getserialports(self):
+        return [port for port in serial.tools.list_ports.comports()]
+
+    def detectusbdevices(self):
+        dev = usb.core.find(find_all=True)
+        ids=[deviceclass(cfg.idVendor,cfg.idProduct) for cfg in dev]
+        return ids
+
+    def detect(self, port):
+        vendortable={
+            0x1199:["Sierra Wireless",3],
+            0x2c7c:["Quectel",3],
+            0x19d2:["ZTE",2],
+            0x0846:["Netgear", 2],
+            0x413c:["Telit",0]
+        }
+        mode="Unknown"
+        for device in self.detectusbdevices():
+            if device.vid==vendor.zte.value:
+                if device.pid==0x0016:
+                    print(f"Detected a {vendortable[device.vid][0]} device with pid {hex(device.pid)} in Diag mode")
+                    mode="AT"
+                    break
+                elif device.pid==0x1403:
+                    print(f"Detected a {vendortable[device.vid][0]} device with pid {hex(device.pid)} in Web mode")
+                    mode="Web"
+                    # url = 'http://192.168.0.1/goform/goform_set_cmd_process?goformId=USB_MODE_SWITCH&usb_mode=1' #adb
+                    url = 'http://192.168.0.1/goform/goform_process?goformId=MODE_SWITCH&switchCmd=FACTORY'
+                    if self.websend(url):
+                        mode="AT"
+                        break
+            elif device.vid==vendor.telit.value:
+                if device.pid==0x81d7:
+                    print(f"Detected a {vendortable[device.vid][0]} device with pid {hex(device.pid)} in Diag mode")
+                    print("Sending download mode command")
+                    interface = 5
+                    diag = qcdiag(loglevel=self.__logger.level, portconfig=[[0x413c, 0x81d7, interface]])
+                    if diag.connect():
+                        data=diag.hdlc.receive_reply()
+                        res = diag.send(b"\x4b\x65\x01\x00")
+                        if res[0]==0x4B:
+                            print("Sending download mode succeeded")
+                        diag.disconnect()
+                    break
+        if mode=="AT" or mode=="Unknown":
+            for port in self.getserialports():
+                if port.vid in vendortable:
+                    portid = port.location[-1:]
+                    if int(portid) == vendortable[port.vid][1]:
+                        print(f"Detected a {vendortable[port.vid][0]} at interface at: " + port.device)
+                        return port.device
+        return ""
+
+    def readreply(self):
+        info = []
+        timeout=0
+        if self.serial is not None:
+            while True:
+                tmp = self.serial.readline().decode('utf-8').replace('\r', '').replace('\n', '')
+                if "OK" in tmp:
+                    info.append(tmp)
+                    return info
+                elif "ERROR" in tmp:
+                    return -1
+                if tmp!="":
+                    info.append(tmp)
+                else:
+                    timeout+=1
+                    if timeout==20:
+                        break
+        return info
+
+    def send(self, cmd):
+        if self.tn is not None:
+            self.tn.write(bytes(cmd + "\r", 'utf-8'))
+            time.sleep(0.05)
+            data = ""
+            while True:
+                tmp = self.tn.read_eager()
+                if tmp != b"":
+                    data += tmp.strip().decode('utf-8')
+                else:
+                    break
+            return data.split("\r\n")
+        elif self.serial is not None:
+            self.serial.write(bytes(cmd + "\r", 'utf-8'))
+            time.sleep(0.05)
+            return self.readreply()
+
+    def close(self):
+        if self.tn is not None:
+            self.tn.close()
+            self.connected = False
+        if self.serial is not None:
+            self.serial.close()
+            self.connected = False
+
+    def ati(self):
+        data={}
+        info = self.send("ATI")
+        if info != -1:
+            for line in info:
+                if "Revision" in line:
+                    data["revision"] = line.split(":")[1].strip()
+                if "Model" in line:
+                    data["model"] = line.split(":")[1].strip()
+                if "Quectel" in line:
+                    data["vendor"] = "Quectel"
+                if "Manufacturer" in line:
+                    data["manufacturer"]=line.split(":")[1].strip()
+                    if "Sierra Wireless" in data["manufacturer"]:
+                        data["vendor"]="Sierra Wireless"
+                    elif "ZTE CORPORATION" in data["manufacturer"]:
+                        data["vendor"]="ZTE"
+                    elif "Netgear" in data["manufacturer"]:
+                        data["vendor"]="Netgear"
+                    elif "Telit" in data["manufacturer"]:
+                        data["vendor"]="Telit"
+        return data
+
+class dwnloadtools(metaclass=LogBase):
+    def sendcmd(self, tn,cmd):
+        tn.write(bytes(cmd,'utf-8')+b"\n")
+        time.sleep(0.05)
+        return tn.read_eager().strip().decode('utf-8')
+
+    def run(self, args):
+        port = args.port
+        cn = connection(port)
+        if cn.connected:
+            info=cn.ati()
+            if "vendor" in info:
+                if info["vendor"]=="Sierra Wireless" or info["vendor"]=="Netgear":
+                    print("Sending download mode command")
+                    print(cn.send("AT!BOOTHOLD\r"))
+                    print(cn.send('AT!QPSTDLOAD\r'))
+                    print("Done switching to download mode")
+                elif info["vendor"]=="Quectel":
+                    print("Sending download mode command")
+                    interface=0
+                    diag = qcdiag(loglevel=self.__logger.level, portconfig=[[0x2c7c,0x0125,interface]])
+                    if diag.connect():
+                        diag.hdlc.receive_reply()
+                        res = diag.send(b"\x4b\x65\x01\x00")
+                        diag.disconnect()
+                        print("Done switching to download mode")
+                elif info["vendor"]=="Telit":
+                    print("Sending download mode command")
+                    interface=0
+                    diag = qcdiag(loglevel=self.__logger.level, portconfig=[[0x2c7c,0x0125,interface]])
+                    if diag.connect():
+                        diag.hdlc.receive_reply()
+                        res = diag.send(b"\x4b\x65\x01\x00")
+                        diag.disconnect()
+                        print("Done switching to download mode")
+                elif info["vendor"]=="ZTE":
+                    print("Sending download mode command")
+                    interface=0
+                    diag = qcdiag(loglevel=self.__logger.level, portconfig=[[0x19d2,0x0016, interface]])
+                    if diag.connect():
+                        diag.hdlc.receive_reply()
+                        res = diag.send(b"\x4b\x65\x01\x00")
+                        if res[0]==0x4B:
+                            print("Done switching to ENANDPRG mode")
+                        else:
+                            res = diag.send(b"\x3a")
+                            if res[0]==0x3A:
+                                while True:
+                                    state=cn.waitforusb(vendor.zte.value,0x0076)
+                                    if not state:
+                                        diag.disconnect()
+                                        if diag.connect():
+                                            res = diag.send(b"\x3a")
+                                    else:
+                                        break
+                                if state:
+                                    print("Done switching to NANDPRG mode")
+                                else:
+                                    print("Failed switching to download mode")
+                        diag.disconnect()
+        cn.close()
+
+def main():
+    version = "1.1"
+    info = 'Modem Gimme-EDL ' + version + ' (c) B. Kerler 2020-2021'
+    parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,description=info)
+    parser.add_argument(
+        '-port', '-p',
+        help='use com port for auto unlock',
+        default="")
+    parser.add_argument(
+        '-logfile', '-l',
+        help='use logfile for debug log',
+        default="")
+    args = parser.parse_args()
+    dw=dwnloadtools()
+    dw.run(args)
+
+if __name__=="__main__":
+    main()
+
+
+==================================================
+FILE: modem/enableadb.py
+==================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2020-2021 under MIT license
+# If you use my code, make sure you refer to my name
+# If you want to use in a commercial product, ask me before integrating it
+import time
+from telnetlib import Telnet
+import serial
+import serial.tools.list_ports
+import argparse
+import requests
+import hashlib
+from diag import qcdiag
+import usb.core
+from enum import Enum
+import crypt
+from sierrakeygen import SierraKeygen
+
+try:
+    from Library.utils import LogBase
+except Exception as e:
+    import os,sys,inspect
+    current_dir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
+    parent_dir = os.path.dirname(current_dir)
+    sys.path.insert(0, parent_dir)
+    from Library.utils import LogBase
+
+class vendor(Enum):
+    sierra = 0x1199
+    quectel = 0x2c7c
+    zte = 0x19d2
+    telit = 0x413c
+    netgear = 0x0846
+
+class deviceclass:
+    vid=0
+    pid=0
+    def __init__(self,vid,pid):
+        self.vid=vid
+        self.pid=pid
+
+class connection:
+    def __init__(self, port=""):
+        self.serial = None
+        self.tn = None
+        self.connected = False
+        if port == "":
+            port = self.detect(port)
+        if port != "":
+            self.serial = serial.Serial(port=port, baudrate=115200, bytesize=8, parity='N', stopbits=1, timeout=1)
+            self.connected = self.serial.is_open
+
+    def waitforusb(self,vid,pid):
+        timeout = 0
+        while timeout < 10:
+            for device in self.detectusbdevices():
+                if device.vid == vid:
+                    if device.pid == pid:
+                        return True
+            time.sleep(1)
+            timeout += 1
+        return False
+
+    def websend(self,url):
+        headers = {'Referer': 'http://192.168.0.1/index.html', 'Accept-Charset': 'UTF-8'}
+        r = requests.get(url, headers=headers)
+        if b"FACTORY:ok" in r.content or b"success" in r.content:
+            print(f"Detected a ZTE in web mode .... switching mode success (convert back by sending \"AT+ZCDRUN=F\" via AT port)")
+            return self.waitforusb(vendor.zte.value,0x0016)
+        return False
+
+    def getserialports(self):
+        return [port for port in serial.tools.list_ports.comports()]
+
+    def detectusbdevices(self):
+        dev = usb.core.find(find_all=True)
+        ids=[deviceclass(cfg.idVendor,cfg.idProduct) for cfg in dev]
+        return ids
+
+    def detect(self, port):
+        atvendortable={
+            0x1199:["Sierra Wireless",3],
+            0x2c7c:["Quectel",3],
+            0x19d2:["ZTE",2],
+            0x413c:["Telit",3],
+            0x0846:["Netgear",2],
+            0x04E8:["Samsung", -1]
+        }
+        mode="Unknown"
+        for device in self.detectusbdevices():
+            if device.vid==vendor.zte.value:
+                if device.pid==0x0016:
+                    print(f"Detected a {atvendortable[device.vid][0]} device with pid {hex(device.pid)} in AT mode")
+                    mode="AT"
+                    break
+                elif device.pid==0x1403:
+                    print(f"Detected a {atvendortable[device.vid][0]} device with pid {hex(device.pid)} in Web mode")
+                    mode="Web"
+                    url = 'http://192.168.0.1/goform/goform_set_cmd_process?goformId=USB_MODE_SWITCH&usb_mode=6'
+                    if self.websend(url):
+                        print("Successfully enabled adb.")
+                    break
+            elif device.vid==vendor.netgear.value:
+                try:
+                    # vid 0846, netgear mr1100, mr5100
+                    self.tn = Telnet("192.168.1.1", 5510, 5)
+                    self.connected = True
+                except:
+                    self.connected = False
+        if mode=="AT" or mode=="Unknown":
+            for port in self.getserialports():
+                if port.vid in atvendortable:
+                    portid = port.location[-1:]
+                    if int(portid) == atvendortable[port.vid][1]:
+                        print(f"Detected a {atvendortable[port.vid][0]} at interface at: " + port.device)
+                        return port.device
+        return ""
+
+    def readreply(self):
+        info = []
+        timeout=0
+        if self.serial is not None:
+            while True:
+                tmp = self.serial.readline().decode('utf-8').replace('\r', '').replace('\n', '')
+                if "OK" in tmp:
+                    info.append(tmp)
+                    return info
+                elif "ERROR" in tmp:
+                    return -1
+                if tmp!="":
+                    info.append(tmp)
+                else:
+                    timeout+=1
+                    if timeout==20:
+                        break
+        return info
+
+    def send(self, cmd):
+        if self.tn is not None:
+            self.tn.write(bytes(cmd + "\r", 'utf-8'))
+            time.sleep(0.05)
+            data = ""
+            while True:
+                tmp = self.tn.read_eager()
+                if tmp != b"":
+                    data += tmp.strip().decode('utf-8')
+                else:
+                    break
+            if "ERROR" in data:
+                return -1
+            return data.split("\r\n")
+        elif self.serial is not None:
+            self.serial.write(bytes(cmd + "\r", 'utf-8'))
+            time.sleep(0.05)
+            resp=self.readreply()
+            return resp
+
+    def close(self):
+        if self.tn is not None:
+            self.tn.close()
+            self.connected = False
+        if self.serial is not None:
+            self.serial.close()
+            self.connected = False
+
+    def ati(self):
+        data={}
+        info = self.send("ATI")
+        if info != -1:
+            for line in info:
+                if "Revision" in line:
+                    data["revision"] = line.split(":")[1].strip()
+                if "Model" in line:
+                    data["model"] = line.split(":")[1].strip()
+                if "Quectel" in line:
+                    data["vendor"] = "Quectel"
+                if "Manufacturer" in line:
+                    data["manufacturer"]=line.split(":")[1].strip()
+                    if "Sierra Wireless" in data["manufacturer"]:
+                        data["vendor"]="Sierra Wireless"
+                    elif "ZTE CORPORATION" in data["manufacturer"]:
+                        data["vendor"]="ZTE"
+                    elif "SIMCOM INCORPORATED" in data["manufacturer"]:
+                        data["vendor"]="Simcom"
+                    elif "Alcatel" in data["manufacturer"]:
+                        data["vendor"]="Alcatel"
+                    elif "Netgear" in data["manufacturer"]:
+                        data["vendor"]="Netgear"
+                    elif "SAMSUNG" in data["manufacturer"]:
+                        data["vendor"]="Samsung"
+        info = self.send("AT+CGMI")
+        if info!=-1:
+            for line in info:
+                if "Quectel" in line:
+                    data["vendor"] = "Quectel"
+                    break
+                elif "Fibucom" in line:
+                    data["vendor"]="Fibucom"
+                    break
+                elif "Netgear" in line:
+                    data["vendor"]="Netgear"
+                    break
+                elif "SAMSUNG" in line:
+                    data["vendor"]="Samsung"
+                    break
+        info = self.send("AT+CGMR")
+        if info!=-1:
+            if len(info)>1:
+                data["model"]=info[1]
+        return data
+
+class adbtools(metaclass=LogBase):
+    def sendcmd(self, tn,cmd):
+        tn.write(bytes(cmd,'utf-8')+b"\n")
+        time.sleep(0.05)
+        return tn.read_eager().strip().decode('utf-8')
+
+    def run(self, args):
+        port = args.port
+        cn = connection(port)
+        if cn.connected:
+            info=cn.ati()
+            if "vendor" in info:
+                if info["vendor"]=="Sierra Wireless" or info["vendor"]=="Netgear":
+                    print("Sending at switch command")
+                    kg=SierraKeygen(cn)
+                    if kg.openlock():
+                        if cn.send('AT!CUSTOM="ADBENABLE",1\r')==-1:
+                            print("Error on sending adb enable command.")
+                            kg.openlock()
+                        if cn.send('AT!CUSTOM="TELNETENABLE",1\r')!=-1:
+                                time.sleep(5)
+                                tn = Telnet("192.168.1.1", 23, 15)
+                                tn.write(b"adbd &\r\n")
+                                info = tn.read_eager()
+                                print(info)
+                                print("Enabled adb via telnet")
+                        else:
+                            print("Error on sending telnet enable command.")
+                        if kg.openlock():
+                            if info["vendor"] == "Netgear":
+                                print("Enabling new port config")
+                                if cn.send("AT!UDPID=68E2"):
+                                    print("Successfully enabled PID 68E2")
+                elif info["vendor"]=="Quectel":
+                    print("Sending at switch command")
+                    salt=cn.send("AT+QADBKEY?\r")
+                    if salt!=-1:
+                        if len(salt)>1:
+                            salt=salt[1]
+                        code = crypt.crypt("SH_adb_quectel", "$1$" + salt)
+                        code = code[12:]
+                        cn.send("AT+QADBKEY=\"%s\"\r" % code)
+                    if cn.send("AT+QCFG=\"usbcfg\",0x2C7C,0x125,1,1,1,1,1,1,0\r")==-1:
+                        if cn.send("AT+QLINUXCMD=\"adbd\"")!=-1: #echo test > /dev/ttyGS0
+                            print("Success enabling adb")
+                    else:
+                        print("Success enabling adb")
+                        print("In order to disable adb, send AT+QCFG=\"usbcfg\",0x2C7C,0x125,1,1,1,1,1,0,0")
+                elif info["vendor"]=="ZTE":
+                    print("Sending switch command via diag")
+                    if cn.send("AT+ZMODE=1")!=-1:
+                        print("Success enabling adb")
+                    else:
+                        interface = 0
+                        diag = qcdiag(loglevel=self.__logger.level, portconfig=[[0x19d2, 0x0016, interface]])
+                        if diag.connect():
+                            res = diag.send(b"\x4B\xA3\x06\x00")
+                            if res[0]==0x4B:
+                                challenge=res[4:4+8]
+                                response=hashlib.md5(challenge).digest()
+                                res = diag.send(b"\x4B\xA3\x07\x00"+response)
+                                if res[0]==0x4B:
+                                    if res[3]==0x00:
+                                        print("Auth success")
+                            res=diag.send(b"\x41" + b"\x30\x30\x30\x30\x30\x30")
+                            if res[1]==0x01:
+                                print("SPC success")
+                            sp=b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFE"
+                            res = diag.send(b"\x46" + sp)
+                            if res[0] == 0x46 and res[1]==0x01:
+                                print("SP success")
+                            else:
+                                res = diag.send(b"\x25" + sp)
+                                if res[0]==0x46 and res[1]==0x01:
+                                    print("SP success")
+                            res = diag.send(b"\x4B\xFA\x0B\x00\x01") #Enable adb serial
+                            if res[0]!=0x13:
+                                print("Success enabling adb serial")
+                            res = diag.send(b"\x4B\x5D\x05\x00") #Operate ADB
+                            if res[0]!=0x13:
+                                print("Success enabling adb")
+                            diag.disconnect()
+                elif info["vendor"]=="Simcom":
+                    print("Sending at switch command")
+                    # Simcom7600
+                    if cn.send("AT+CUSBADB=1,1")!=-1:
+                        print("Success enabling adb")
+                elif info["vendor"]=="Fibocom":
+                    print("Sending at switch command")
+                    # FibocomL718:
+                    if cn.send("AT+ADBDEBUG=1")!=-1:
+                        print("Success enabling adb")
+                elif info["vendor"]=="Alcatel":
+                    print("Send scsi switch command")
+                    print("Run \"sudo sg_raw /dev/sg0 16 f9 00 00 00 00 00 00 00 00 00 00 00 00 00 00 -v\" to enable adb")
+                elif info["vendor"]=="Samsung":
+                    if cn.send("AT+USBMODEM=1"):
+                        print("Success enabling adb")
+                    elif cn.send("AT+SYSSCOPE=1,0,0"):
+                        print("Success enabling adb")
+
+        cn.close()
+
+def main():
+    version = "1.1"
+    info = 'Modem Gimme-ADB ' + version + ' (c) B. Kerler 2020-2021'
+    parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter, description=info)
+    parser.add_argument(
+        '-port', '-p',
+        help='use com port for at',
+        default="")
+    parser.add_argument(
+        '-logfile', '-l',
+        help='use logfile for debug log',
+        default="")
+    args = parser.parse_args()
+    ad=adbtools()
+    ad.run(args)
+
+if __name__=="__main__":
+    main()
+
+
+
+==================================================
+FILE: modem/sierrakeygen.py
+==================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# (c) B.Kerler 2019-2020 under MIT license
+# If you use my code, make sure you refer to my name
+# If you want to use in a commercial product, ask me before integrating it
+
+import serial
+import sys
+import argparse
+import time
+import serial.tools.list_ports
+from telnetlib import Telnet
+from binascii import hexlify, unhexlify
+
+try:
+    from Library.utils import LogBase
+except Exception as e:
+    import os,sys,inspect
+    current_dir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
+    parent_dir = os.path.dirname(current_dir)
+    sys.path.insert(0, parent_dir)
+    from diag import qcdiag
+    from Library.utils import LogBase
+
+'''
+C7 = 7 0		0	2	7		5 0
+C6 = 3 1		7	0	3		0 1
+C5 = 0 2		5	3	0		3 2
+C8 = 1 3		3	1	5		7 3
+C4 = 5 4		1	4	1		1 4					
+'''
+prodtable = {
+    "MDM8200": dict(openlock=0, openmep=1, opencnd=0, clen=8, init=[1, 3, 5, 7, 0],
+                    run="resultbuffer[i]=self.SierraAlgo(challenge[i], 2, 4, 1, 3, 0, 3, 4, 0)"),
+    # MC878XC_F1.2.3.15 verified, key may be stored in nvitem 0x4e21;MC8700 M3.0.9.0 verified
+    "MDM9200": dict(openlock=0, openmep=1, opencnd=0, clen=8, init=[7, 3, 0, 1, 5],
+                    run="resultbuffer[i]=self.SierraAlgo(challenge[i], 4, 2, 1, 0, 3, 2, 0, 0)"),
+    # AC881U, EM8805 SWI9X15C_05.05.58.00, at!openlock?6A1F1CEA298A14B0 => AT!OPENLOCK="3A9EA70D86FEE58C"
+    "MDM9200_V1": dict(openlock=2, openmep=1, opencnd=0, clen=8, init=[7, 3, 0, 1, 5],
+                       run="resultbuffer[i]=self.SierraAlgo(challenge[i], 4, 2, 1, 0, 3, 2, 0, 0)"),  # AC710
+    "MDM9200_V2": dict(openlock=3, openmep=1, opencnd=0, clen=8, init=[7, 3, 0, 1, 5],
+                       run="resultbuffer[i]=self.SierraAlgo(challenge[i], 4, 2, 1, 0, 3, 2, 0, 0)"),  # AC775
+    "MDM9200_V3": dict(openlock=8, openmep=1, opencnd=8, clen=8, init=[7, 3, 0, 1, 5],
+                       run="resultbuffer[i]=self.SierraAlgo(challenge[i], 4, 2, 1, 0, 3, 2, 0, 0)"),  # AC775
+    "MDM9x15": dict(openlock=0, openmep=1, opencnd=0, clen=8, init=[7, 3, 0, 1, 5],
+                    run="resultbuffer[i]=self.SierraAlgo(challenge[i], 4, 2, 1, 0, 3, 2, 0, 0)"),
+    # 9x15C 06.03.32.02, AC340U 1.13.12.14 verified, #AT!CUSTOM=\"ADBENABLE\",1
+    "MDM9x07": dict(openlock=9, openmep=10, opencnd=9, clen=8, init=[7, 3, 0, 1, 5],
+                    run="resultbuffer[i]=self.SierraAlgo(challenge[i], 4, 2, 1, 0, 3, 2, 0, 0)"),
+    # SWI9X07Y_02.25.02.01
+    "MDM9x30": dict(openlock=5, openmep=4, opencnd=5, clen=8, init=[7, 3, 0, 1, 5],
+                    run="resultbuffer[i]=self.SierraAlgo(challenge[i], 4, 2, 1, 0, 3, 2, 0, 0)"),
+    # MC7455_2.30.01.01 #4
+    "MDM9x30_V1": dict(openlock=17, openmep=15, opencnd=17, clen=8, init=[7, 3, 0, 1, 5],
+                       run="resultbuffer[i]=self.SierraAlgo(challenge[i], 4, 2, 1, 0, 3, 2, 0, 0)"),
+    # AC791L/AC790S NTG9X35C_02.08.29.00
+    "MDM9x40": dict(openlock=11, openmep=12, opencnd=11, clen=8, init=[7, 3, 0, 1, 5],
+                    run="resultbuffer[i]=self.SierraAlgo(challenge[i], 4, 2, 1, 0, 3, 2, 0, 0)"),  # AC815s
+    "MDM9x50": dict(openlock=7, openmep=6, opencnd=7, clen=8, init=[7, 3, 0, 1, 5],
+                    run="resultbuffer[i]=self.SierraAlgo(challenge[i], 4, 2, 1, 0, 3, 2, 0, 0)"),  # EM7565
+    "MDM9x06": dict(openlock=20, openmep=19, opencnd=20, clen=8, init=[7, 3, 0, 1, 5],
+                    run="resultbuffer[i]=self.SierraAlgo(challenge[i], 4, 2, 1, 0, 3, 2, 0, 0)"),  # WP77xx
+    "SDX55": dict(openlock=22, openmep=21, opencnd=22, clen=8, init=[7, 3, 0, 1, 5], #MR5100
+                       run="resultbuffer[i]=self.SierraAlgo(challenge[i], 4, 2, 1, 0, 3, 2, 0, 0)"),
+    "MDM9x15A": dict(openlock=24, openmep=23, opencnd=24, clen=8, init=[7, 3, 0, 1, 5], #AC779S
+                       run="resultbuffer[i]=self.SierraAlgo(challenge[i], 4, 2, 1, 0, 3, 2, 0, 0)"),
+
+}
+
+infotable = {
+    "MDM8200": ["M81A", "M81B", "AC880", "AC881", "MC8780", "MC8781", "AC880E", "AC881E", "EM8780", "EM8781",
+                "MC8780V", "MC8781V", "MC8700", "AC308U"],
+    "MDM9200": ["AC710", "MC8775", "MC8775V", "AC875", "MC8700", "AC313U", "MC8801", "MC7700", "MC7750", "MC7710",
+                "EM7700", "770S", "781S"],
+    "MDM9200_V1": ["AC710", "MC8775", "MC8775V", "AC875", "MC8700", "AC313U", "MC8801", "MC7700", "MC7750",
+                   "MC7710", "EM7700"],
+    "MDM9200_V2": ["AC775", "PC7200"],
+    "MDM9200_V3": ["AC775"],
+    "MDM9x07": ["SWI9X07Y", "WP76xx"],
+    "MDM9x06": ["SWI9X06Y", "WP77xx"],
+    "MDM9x15": ["SWI9X15C", "AR7550", "AR7552", "AR7554", "EM7355", "EM7655", "MC7354", "WP7100", "WP7102", "WP7104",
+                "MC7305", "EM7305", "MC8805", "EM8805", "MC7350", "MC7350-L", "MC7802", "MC7304", "AR7556", "AR7558",
+                "WP75xx", "WP85xx", "WP8548", "WP8548G", "AC340U"],
+    "MDM9x15A": ["AC779S"],
+    "MDM9x30": ["EM7455", "MC7455", "EM7430", "MC7430"],
+    "MDM9x30_V1": ["Netgear AC790/MDM9230"],
+    "MDM9x40": ["AC815s", "AC785s", "AC797S", "MR1100"],
+    "MDM9x50": ["EM7565", "EM7565-9", "EM7511", "EM7411"],
+    "SDX55" : ["MR5100"]
+}
+
+keytable = bytearray([0xF0, 0x14, 0x55, 0x0D, 0x5E, 0xDA, 0x92, 0xB3, 0xA7, 0x6C, 0xCE, 0x84, 0x90, 0xBC, 0x7F, 0xED,
+                      # 0 MC8775_H2.0.8.19 !OPENLOCK, !OPENCND .. MC8765V,MC8765,MC8755V,MC8775,MC8775V,MC8775,AC850,
+                      #   AC860,AC875,AC881,AC881U,AC875, AC340U 1.13.12.14
+                      0x61, 0x94, 0xCE, 0xA7, 0xB0, 0xEA, 0x4F, 0x0A, 0x73, 0xC5, 0xC3, 0xA6, 0x5E, 0xEC, 0x1C, 0xE2,
+                      # 1 MC8775_H2.0.8.19 AC340U, OPENMEP default
+                      0x39, 0xC6, 0x7B, 0x04, 0xCA, 0x50, 0x82, 0x1F, 0x19, 0x63, 0x36, 0xDE, 0x81, 0x49, 0xF0, 0xD7,
+                      # 2 AC750,AC710,AC7XX,SB750A,SB750,PC7000,AC313u OPENMEP
+                      0xDE, 0xA5, 0xAD, 0x2E, 0xBE, 0xE1, 0xC9, 0xEF, 0xCA, 0xF9, 0xFE, 0x1F, 0x17, 0xFE, 0xED, 0x3B,
+                      # 3 AC775,PC7200
+                      0xFE, 0xD4, 0x40, 0x52, 0x2D, 0x4B, 0x12, 0x5C, 0xE7, 0x0D, 0xF8, 0x79, 0xF8, 0xC0, 0xDD, 0x37,
+                      # 4 MC7455_02.30.01.01 OPENMEP
+                      0x3B, 0x18, 0x99, 0x6B, 0x57, 0x24, 0x0A, 0xD8, 0x94, 0x6F, 0x8E, 0xD9, 0x90, 0xBC, 0x67, 0x56,
+                      # 5 MC7455_02.30.01.01 OPENLOCK
+                      0x47, 0x4F, 0x4F, 0x44, 0x4A, 0x4F, 0x42, 0x44, 0x45, 0x43, 0x4F, 0x44, 0x49, 0x4E, 0x47, 0x2E,
+                      # 6 SWI9x50 Openmep Key SWI9X50C_01.08.04.00
+                      0x4F, 0x4D, 0x41, 0x52, 0x20, 0x44, 0x49, 0x44, 0x20, 0x54, 0x48, 0x49, 0x53, 0x2E, 0x2E, 0x2E,
+                      # 7 SWI9x50 Openlock Key SWI9X50C_01.08.04.00
+                      0x8F, 0xA5, 0x85, 0x05, 0x5E, 0xCF, 0x44, 0xA0, 0x98, 0x8B, 0x09, 0xE8, 0xBB, 0xC6, 0xF7, 0x65,
+                      # 8 MDM8200 Special
+                      0x4D, 0x42, 0xD8, 0xC1, 0x25, 0x44, 0xD8, 0xA0, 0x1D, 0x80, 0xC4, 0x52, 0x8E, 0xEC, 0x8B, 0xE3,
+                      # 9 SWI9x07 Openlock Key 02.25.02.01
+                      0xED, 0xA9, 0xB7, 0x0A, 0xDB, 0x85, 0x3D, 0xC0, 0x92, 0x49, 0x7D, 0x41, 0x9A, 0x91, 0x09, 0xEE,
+                      # 10 SWI9x07 Openmep Key 02.25.02.01
+                      0x8A, 0x56, 0x03, 0xF0, 0xBB, 0x9C, 0x13, 0xD2, 0x4E, 0xB2, 0x45, 0xAD, 0xC4, 0x0A, 0xE7, 0x52,
+                      # 11 NTG9X40C_11.14.08.11 / mdm9x40r11_core AC815s / SWI9x50 MR1100 Openlock Key
+                      0x2A, 0xEF, 0x07, 0x2B, 0x19, 0x60, 0xC9, 0x01, 0x8B, 0x87, 0xF2, 0x6E, 0xC1, 0x42, 0xA8, 0x3A,
+                      # 12 SWI9x50 MR1100 Openmep Key
+                      0x28, 0x55, 0x48, 0x52, 0x24, 0x72, 0x63, 0x37, 0x14, 0x26, 0x37, 0x50, 0xBE, 0xFE, 0x00, 0x00,
+                      # 13 SWI9x50 Unknown key
+                      0x22, 0x63, 0x48, 0x02, 0x24, 0x72, 0x27, 0x37, 0x19, 0x26, 0x37, 0x50, 0xBE, 0xEF, 0xCA, 0xFE,
+                      # 14 SWI9x50,SWI9X06Y IMEI nv key
+                      0x98, 0xE1, 0xC1, 0x93, 0xC3, 0xBF, 0xC3, 0x50, 0x8D, 0xA1, 0x35, 0xFE, 0x50, 0x47, 0xB3, 0xC4,
+                      # 15 NTG9X35C_02.08.29.00 Openmep Key AC791L/AC790S Old
+                      0x61, 0x94, 0xCE, 0xA7, 0xB0, 0xEA, 0x4F, 0x0A, 0x73, 0xC5, 0xC3, 0xA6, 0x5E, 0xEC, 0x1C, 0xE2,
+                      # 16 NTG9X35C_02.08.29.00 Openmep Key AC791/AC790S, NTGX55_10.25.15.02 MR5100 Alternative
+                      0xC5, 0x50, 0x40, 0xDA, 0x23, 0xE8, 0xF4, 0x4C, 0x29, 0xE9, 0x07, 0xDE, 0x24, 0xE5, 0x2C, 0x1D,
+                      # 17 NTG9X35C_02.08.29.00 Openlock Key AC791/AC790S Old
+                      0xF0, 0x14, 0x55, 0x0D, 0x5E, 0xDA, 0x92, 0xB3, 0xA7, 0x6C, 0xCE, 0x84, 0x90, 0xBC, 0x7F, 0xED,
+                      # 18 NTG9X35C_02.08.29.00 Openlock Key AC791/AC790S, NTGX55_10.25.15.02 MR5100 Alternative
+                      0x78, 0x19, 0xC5, 0x6D, 0xC3, 0xD8, 0x25, 0x3E, 0x51, 0x60, 0x8C, 0xA7, 0x32, 0x83, 0x37, 0x9D,
+                      # 19 SWI9X06Y_02.14.04.00 Openmep Key WP77xx
+                      0x12, 0xF0, 0x79, 0x6B, 0x19, 0xC7, 0xF4, 0xEC, 0x50, 0xF3, 0x8C, 0x40, 0x02, 0xC9, 0x43, 0xC8,
+                      # 20 SWI9X06Y_02.14.04.00 Openlock Key WP77xx
+                      0x49, 0x42, 0xFF, 0x76, 0x8A, 0x95, 0xCF, 0x7B, 0xA3, 0x47, 0x5F, 0xF5, 0x8F, 0xD8, 0x45, 0xE4,
+                      # 21 NTGX55 Openmep Key, NTGX55_10.25.15.02 MR5100
+                      0xF8, 0x1A, 0x3A, 0xCC, 0xAA, 0x2B, 0xA5, 0xE8, 0x8B, 0x53, 0x5A, 0x55, 0xB9, 0x65, 0x57, 0x98,
+                      # 22 NTGX55 Openlock Key, NTGX55_10.25.15.02 MR5100
+                      0x54, 0xC9, 0xC7, 0xA4, 0x02, 0x1C, 0xB0, 0x11, 0x05, 0x22, 0x39, 0xB7, 0x84, 0xEF, 0x16, 0xCA,
+                      # 23 NTG9X15A Openlock Key, NTG9X15A_01.08.02.00
+                      0xC7, 0xE6, 0x39, 0xFE, 0x0A, 0xC7, 0xCA, 0x4D, 0x49, 0x8F, 0xD8, 0x55, 0xEB, 0x1A, 0xCD, 0x8A
+                      # 24 NTG9X15A Openlock Key, NTG9X15A_01.08.02.00
+                      ])
+
+
+class SierraGenerator():
+    tbl = bytearray()
+    rtbl = bytearray()
+
+    def __init__(self):
+        for i in range(0, 0x14):
+            self.rtbl.append(0x0)
+        for i in range(0, 0x100):
+            self.tbl.append(0x0)
+
+    def run(self, devicegeneration, challenge, type):
+        challenge = bytearray(unhexlify(challenge))
+
+        self.devicegeneration = devicegeneration
+        if not devicegeneration in prodtable:
+            print("Sorry, " + devicegeneration + " not supported.")
+            exit(0)
+
+        mepid = prodtable[devicegeneration]["openmep"]
+        cndid = prodtable[devicegeneration]["opencnd"]
+        lockid = prodtable[devicegeneration]["openlock"]
+        clen = prodtable[devicegeneration]["clen"]
+        if len(challenge) < clen:
+            for i in range(0, clen - len(challenge)):
+                challenge.append(0)
+
+        challengelen = len(challenge)
+        if type == 0:  # lockkey
+            idf = lockid
+        elif type == 1:  # mepkey
+            idf = mepid
+        elif type == 2:  # cndkey
+            idf = cndid
+
+        key = keytable[idf * 16:(idf * 16) + 16]
+        resp = self.SierraKeygen(challenge, key, challengelen, 16)[:challengelen]
+        resp = hexlify(resp).decode('utf-8').upper()
+        return resp
+
+    def selftest(self):
+        challenge = "8101A18AB3C3E66A"  # Verified, EM7305
+        devicegeneration = "MDM9x15"  # MSM9200
+        openlock = self.run(devicegeneration, challenge, 0)
+        if openlock != 'D1E128FCA8A963ED':
+            return False
+
+        challenge = "BE96CBBEE0829BCA"  # Verified
+        devicegeneration = "MDM9x40"
+        openlock = self.run(devicegeneration, challenge, 0)
+        if openlock != '1033773720F6EE66':
+            return False
+
+        devicegeneration = "MDM9x30"
+        openlock = self.run(devicegeneration, challenge, 0)
+        if openlock != '1E02CE6A98B7DD2A':
+            return False
+
+        devicegeneration = "MDM9x50"
+        openlock = self.run(devicegeneration, challenge, 0)
+        if openlock != '32AB617DB4B1C205':
+            return False
+
+        devicegeneration = "MDM9x06"
+        openlock = self.run(devicegeneration, challenge, 0)
+        if openlock != '28D718CCD669DEDE':
+            return False
+
+        devicegeneration = "MDM9x07"
+        openlock = self.run(devicegeneration, challenge, 0)
+        if openlock != 'F5A4C9A0D402E34E':
+            return False
+
+        devicegeneration = "MDM8200"
+        openlock = self.run(devicegeneration, challenge, 0)
+        if openlock != 'EE702212D9C12FAB':
+            return False
+
+        devicegeneration = "MDM9200_V1"
+        openlock = self.run(devicegeneration, challenge, 0)
+        if openlock != 'A9A4E76E2653F753':
+            return False
+
+        devicegeneration = "MDM9200_V2"
+        openlock = self.run(devicegeneration, challenge, 0)
+        if openlock != '8B0FAB4B6F81B080':
+            return False
+
+        devicegeneration = "MDM9200_V3"
+        openlock = self.run(devicegeneration, challenge, 0)
+        if openlock != '4A69AD8A69F390E0':
+            return False
+
+        devicegeneration = "MDM9x30_V1"
+        openlock = self.run(devicegeneration, challenge, 0)
+        if openlock != '6A5E4C9CBCBDA7DC':
+            return False
+
+        challenge = "BE96CBBEE0829BCA"  # Verified
+        devicegeneration = "MDM9200"
+        openlock = self.run(devicegeneration, challenge, 0)
+        if openlock != 'EEDBF8BFF8DAE346':
+            return False
+
+        challenge = "20E253156762DACE" # Verified
+        devicegeneration = "SDX55"
+        openlock = self.run(devicegeneration, challenge, 0)
+        if openlock != '03940D7067145323':
+            return False
+
+        return True
+
+    def SierraPreInit(self, counter, key, keylen, challengelen, mcount):
+        if counter != 0:
+            tmp2 = 0
+            i = 1
+            while i < counter:
+                i = 2 * i + 1
+            while True:
+                tmp = mcount
+                mcount = tmp + 1
+                challengelen = (key[tmp & 0xFF] + self.tbl[(challengelen & 0xFF)]) & 0xFF
+                if mcount >= keylen:
+                    mcount = 0
+                    challengelen = ((challengelen & 0xFF) + keylen) & 0xFF
+                tmp2 = tmp2 + 1
+                tmp3 = ((challengelen & 0xFF) & i) & 0xFF
+                if tmp2 >= 0xB:
+                    tmp3 = counter % tmp3
+                if tmp3 <= counter:
+                    break
+            counter = tmp3 & 0xFF
+        return [counter, challengelen, mcount]
+
+    def SierraInit(self, key, keylen):
+        if keylen == 0 or keylen > 0x20:
+            retval = [0, keylen]
+        elif keylen >= 1 and keylen <= 0x20:
+            for i in range(0, 0x100):
+                self.tbl[i] = i & 0xFF
+            mcount = 0
+            cl = keylen & 0xffffff00
+            i = 0xFF
+            while i > -1:
+                t, cl, mcount = self.SierraPreInit(i, key, keylen, cl, mcount)
+                m = self.tbl[i]
+                self.tbl[i] = self.tbl[(t & 0xff)]
+                i = i - 1
+                self.tbl[(t & 0xFF)] = m
+            self.rtbl[0] = self.tbl[prodtable[self.devicegeneration]["init"][0]] if \
+                prodtable[self.devicegeneration]["init"][0] != 0 else self.tbl[(cl & 0xFF)]
+            self.rtbl[1] = self.tbl[prodtable[self.devicegeneration]["init"][1]] if \
+                prodtable[self.devicegeneration]["init"][1] != 0 else self.tbl[(cl & 0xFF)]
+            self.rtbl[2] = self.tbl[prodtable[self.devicegeneration]["init"][2]] if \
+                prodtable[self.devicegeneration]["init"][2] != 0 else self.tbl[(cl & 0xFF)]
+            self.rtbl[3] = self.tbl[prodtable[self.devicegeneration]["init"][3]] if \
+                prodtable[self.devicegeneration]["init"][3] != 0 else self.tbl[(cl & 0xFF)]
+            self.rtbl[4] = self.tbl[prodtable[self.devicegeneration]["init"][4]] if \
+                prodtable[self.devicegeneration]["init"][4] != 0 else self.tbl[(cl & 0xFF)]
+            retval = [1, keylen]
+        return retval
+
+    def sierra_calc8F(self, challenge, a=0, b=1, c=2, d=3, e=4, ret=0, ret2=2):
+        # MDM9200
+        self.rtbl[b] = (self.rtbl[b] + self.tbl[(self.rtbl[d] & 0xFF)]) & 0xFF
+        uVar2 = self.rtbl[c] & 0xFF
+        bVar1 = self.tbl[uVar2]
+        uVar4 = self.rtbl[b] & 0xFF
+        self.tbl[uVar2] = self.tbl[uVar4]
+        self.rtbl[d] = (self.rtbl[d] + 1) & 0xFF
+        uVar5 = self.rtbl[a] & 0xFF
+        self.tbl[uVar4] = self.tbl[uVar5]
+        uVar3 = self.rtbl[d] & 0xFF
+        self.tbl[uVar5] = self.tbl[uVar3]
+        self.tbl[uVar3] = bVar1
+        self.rtbl[ret] = challenge  # c
+        self.rtbl[ret2] = self.tbl[self.tbl[(self.tbl[(self.rtbl[e] + self.tbl[bVar1]) & 0xFF] + (
+                self.tbl[uVar5] & 0xFF) + (self.tbl[uVar2] & 0xFF) & 0xff) & 0xFF] & 0xFF] ^ self.tbl[
+                              ((self.tbl[uVar4] & 0xFF) + (bVar1 & 0xff)) & 0xFF] ^ challenge  # a
+        self.rtbl[e] = (self.rtbl[e] + self.tbl[bVar1]) & 0xFF
+        return self.rtbl[ret2] & 0xFF  # a
+
+    def SierraAlgo(self, challenge, a=0, b=1, c=2, d=3, e=4, ret=3, ret2=1, flag=1):  # M9x15
+        v6 = self.rtbl[e]
+        v0 = (v6 + 1) & 0xFF
+        self.rtbl[e] = v0
+        self.rtbl[c] = (self.tbl[v6 + flag & 0xFF] + self.rtbl[c]) & 0xFF
+        v4 = self.rtbl[c] & 0xFF
+        v2 = self.rtbl[b] & 0xFF
+        v1 = self.tbl[(v2 & 0xFF)]
+        self.tbl[(v2 & 0xFF)] = self.tbl[(v4 & 0xFF)]
+        v5 = self.rtbl[d] & 0xFF
+        self.tbl[(v4 & 0xFF)] = self.tbl[(v5 & 0xFF)]
+        self.tbl[(v5 & 0xFF)] = self.tbl[(v0 & 0xFF)]
+        self.tbl[v0] = v1 & 0xFF
+        u = self.tbl[(self.tbl[(
+                self.tbl[((self.rtbl[a] + self.tbl[(v1 & 0xFF)]) & 0xFF)] + self.tbl[(v5 & 0xFF)] + self.tbl[
+            (v2 & 0xFF)] & 0xff)] & 0xFF)]
+        v = self.tbl[((self.tbl[(v4 & 0xFF)] + v1) & 0xFF)]
+        self.rtbl[ret] = u ^ v ^ challenge
+        self.rtbl[a] = (self.tbl[(v1 & 0xFF)] + self.rtbl[a]) & 0xFF
+        self.rtbl[ret2] = challenge & 0xFF
+        return self.rtbl[ret] & 0xFF
+
+    def SierraFinish(self):
+        for i in range(0, 0x100):
+            self.tbl[i] = 0
+        self.rtbl[0] = 0
+        self.rtbl[1] = 0
+        self.rtbl[2] = 0
+        self.rtbl[3] = 0
+        self.rtbl[4] = 0
+        return 1
+
+    def SierraKeygen(self, challenge, key, challengelen, keylen):
+        resultbuffer = bytearray()
+        for i in range(0, 0x100 + 1):
+            resultbuffer.append(0x0)
+        ret, keylen = self.SierraInit(key, keylen)
+        if ret:
+            for i in range(0, challengelen):
+                exec(prodtable[self.devicegeneration]["run"]) # uses challenge
+            self.SierraFinish()
+        return resultbuffer
+
+
+class connection:
+    def __init__(self, port=""):
+        self.serial = None
+        self.tn = None
+        self.connected = False
+        if port == "":
+            port = self.detect(port)
+            if port == "":
+                self.tn = Telnet("192.168.1.1", 5510)
+                self.connected = True
+        if port != "":
+            self.serial = serial.Serial(port=port, baudrate=115200, bytesize=8, parity='N', stopbits=1, timeout=1)
+            self.connected = self.serial.is_open
+
+    def detect(self, port):
+        if port == "":
+            for port in serial.tools.list_ports.comports():
+                if port.vid == 0x1199:
+                    portid = port.location[-1:]
+                    if int(portid) == 3:
+                        print("Detected Sierra Wireless device at: " + port.device)
+                        return port.device
+                elif port.vid == 0x8046:
+                    portid = port.location[-1:]
+                    if int(portid) == 3:
+                        print("Detected Netgear device at: " + port.device)
+                        return port.device
+
+        return ""
+
+    def readreply(self):
+        info = []
+        if self.serial is not None:
+            while (True):
+                tmp = self.serial.readline().decode('utf-8').replace('\r', '').replace('\n', '')
+                if "OK" in info:
+                    return info
+                elif ("ERROR" in info) or info == "":
+                    return -1
+                info.append(tmp)
+        return info
+
+    def send(self, cmd):
+        if self.tn is not None:
+            self.tn.write(bytes(cmd + "\r", 'utf-8'))
+            time.sleep(0.05)
+            data = ""
+            while True:
+                tmp = self.tn.read_eager()
+                if tmp != b"":
+                    data += tmp.strip().decode('utf-8')
+                else:
+                    break
+            return data.split("\r\n")
+        elif self.serial is not None:
+            self.serial.write(bytes(cmd + "\r", 'utf-8'))
+            time.sleep(0.05)
+            return self.readreply()
+
+    def close(self):
+        if self.tn is not None:
+            self.tn.close()
+            self.connected = False
+        if self.serial is not None:
+            self.serial.close()
+            self.connected = False
+
+class SierraKeygen(metaclass=LogBase):
+    def __init__(self,cn,devicegeneration=None):
+        self.cn=cn
+        self.keygen = SierraGenerator()
+        print("Running self-test ...")
+        if self.keygen.selftest():
+            print("PASSED!")
+        else:
+            print("FAILED!")
+        if devicegeneration==None:
+            self.detectdevicegeneration()
+        else:
+            self.devicegeneration=devicegeneration
+
+    def detectdevicegeneration(self):
+        if self.cn.connected:
+            info = self.cn.send("ATI")
+            if info != -1:
+                revision = ""
+                model = ""
+                for line in info:
+                    if "Revision" in line:
+                        revision = line.split(":")[1].strip()
+                    if "Model" in line:
+                        model = line.split(":")[1].strip()
+                if revision != "":
+                    if "9200" in revision:
+                        devicegeneration = "MDM9200" #AC762S NTG9200H2_03.05.14.12ap
+                    if "9X07" in revision:
+                        devicegeneration = "MDM9x07"
+                    elif "9X25" in revision:
+                        if "NTG9X25C" in revision:
+                            devicegeneration = "MDM9200" #AC781S NTG9X25C_01.00.57.00
+                    elif "9X15" in revision:
+                        if "NTG9X15A" in revision:
+                            devicegeneration = "MDM9x15A" #Aircard 779S
+                        elif "NTG9X15C" in revision:
+                            devicegeneration = "MDM9200" #AC770S NTG9X15C_01.18.02.00
+                        else:
+                            devicegeneration = "MDM9x15"
+                    elif "9X30" in revision:
+                        if "NTG9X35C" in revision: #790S NTG9X35C_11.11.15.03
+                            devicegeneration = "MDM9x30_V1"
+                        else:
+                            devicegeneration = "MDM9x30"
+                    elif "9X40" in revision:
+                        devicegeneration = "MDM9x40"
+                    elif "9X50" in revision:
+                        if "NTG9X50" in revision:
+                            devicegeneration = "MDM9x40" #MR1100,AC797S NTG9X50C_12.06.03.00
+                        else:
+                            devicegeneration = "MDM9x50"
+                    elif "9X06" in revision:
+                        devicegeneration = "MDM9x06"
+                    elif "X55" in revision:
+                        if "NTGX55" in revision: #MR5100 NTGX55_10.25.15.02
+                            devicegeneration = "SDX55"
+                        devicegeneration = "SDX55"
+                    #Missing:
+                    # SDX24 Sierra
+                    # MR2100 NTGX24_10.17.03.00
+                    # SDX55 Sierra
+                    # AC810S NTG9X40C_11.14.08.16
+                    # AC800S NTG9X40C_11.14.07.00
+                    self.devicegeneration=devicegeneration
+            else:
+                print("Error on getting ATI modem response. Wrong port? Aborting.")
+                self.cn.close()
+                exit(0)
+
+    def openlock(self):
+        print("Device generation detected: " + self.devicegeneration)
+        #print("Sending AT!ENTERCND=\"A710\" request.")
+        #info = self.cn.send("AT!ENTERCND=\"A710\"")
+        #if info == -1:
+        #    print("Uhoh ... invalid entercnd password. Aborting ...")
+        #    return
+        print("Sending AT!OPENLOCK? request")
+        info = self.cn.send("AT!OPENLOCK?")
+        challenge = ""
+        if info != -1:
+            if len(info) > 2:
+                challenge = info[1]
+        else:
+            print("Error on AT!OPENLOCK? request. Aborting.")
+            return
+        if challenge == "":
+            print("Error: Couldn't get challenge. Aborting.")
+            return
+        resp = self.keygen.run(self.devicegeneration, challenge, 0)
+        print("Sending AT!OPENLOCK=\"" + resp + "\" response.")
+        info = self.cn.send("AT!OPENLOCK=\"" + resp + "\"")
+        if info == -1:
+            print("Damn. AT!OPENLOCK failed.")
+        else:
+            print("Success. Device is now engineer unlocked.")
+            return True
+        return False
+
+def main(args):
+    version = "1.3"
+    info = 'Sierra Wireless Generator ' + version + ' (c) B. Kerler 2019-2021'
+    parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,description=info)
+
+    parser.add_argument(
+        '-openlock', '-l',
+        help='AT!OPENLOCK? modem response',
+        default="")
+
+    parser.add_argument(
+        '-openmep', '-m',
+        help='AT!OPENMEP? modem response',
+        default="")
+
+    parser.add_argument(
+        '-opencnd', '-c',
+        help='AT!OPENCND? modem response',
+        default="")
+
+    parser.add_argument(
+        '-devicegeneration', '-d',
+        help='Device devicegeneration generation',
+        default="")
+
+    parser.add_argument(
+        '-port', '-p',
+        help='use com port for auto unlock',
+        default="")
+
+    parser.add_argument(
+        '-unlock', '-u',
+        help='use com port for openlock',
+        default=False, action='store_true')
+
+    args = parser.parse_args()
+
+    openlock = args.openlock
+    openmep = args.openmep
+    opencnd = args.opencnd
+    devicegeneration = args.devicegeneration
+
+    if (devicegeneration == "" or (openlock == "" and openmep == "" and opencnd == "")) and not args.unlock:
+        print(info)
+        print("------------------------------------------------------------\n")
+        print("Usage: ./sierrakeygen [-l,-m,-c] [challenge] -d [devicegeneration]")
+        print("Example: ./sierrakeygen.py -l BE96CBBEE0829BCA -d MDM9200")
+        print("or: ./sierrakeygen.py -u for auto unlock")
+        print("or: ./sierrakeygen.py -u -p [portname] for auto unlock with given portname")
+        print("Supported devicegenerations :")
+        for key in infotable:
+            info = f"\t{key}:\t\t"
+            count = 0
+            for item in infotable[key]:
+                count += 1
+                if count > 15:
+                    info += "\n\t\t\t\t\t"
+                    count = 0
+                info += item + ","
+
+            info = info[:-1]
+            print(info)
+        exit(0)
+
+    if devicegeneration == "" and not args.unlock:
+        print("You need to specific a device generation as well. Option -d")
+        exit(0)
+    if devicegeneration == "":
+        devicegeneration=None
+    if args.unlock:
+        cn = connection(args.port)
+        if cn.connected:
+            kg=SierraKeygen(cn,devicegeneration)
+            if kg.devicegeneration == "":
+                print("Unknown device generation. Please send me details :)")
+            else:
+                kg.openlock()
+        cn.close()
+    else:
+        kg = SierraKeygen(None, devicegeneration)
+        if openlock != "":
+            resp = kg.keygen.run(devicegeneration, openlock, 0)
+            print("AT!OPENLOCK=\"" + resp + "\"")
+        elif openmep != "":
+            resp = kg.keygen.run(devicegeneration, openmep, 1)
+            print("AT!OPENMEP=\"" + resp + "\"")
+        elif opencnd != "":
+            resp = kg.keygen.run(devicegeneration, opencnd, 2)
+            print("AT!OPENCND=\"" + resp + "\"")
+
+
+if __name__ == '__main__':
+    main(sys.argv)
+

@@ -1,0 +1,30 @@
+<resources>
+    <string name="app_name">Native Unlock Tool</string>
+    <string name="btn_memory_test">Memory Test</string>
+    <string name="btn_patch_vbmeta">Patch VBMeta</string>
+    <string name="btn_meta_mode">META Mode</string>
+    <string name="btn_read_rpmb">Read RPMB</string>
+    <string name="btn_write_rpmb">Write RPMB</string>
+    <string name="btn_erase_rpmb">Erase RPMB</string>
+    <string name="btn_read_gpt">Read GPT</string>
+    <string name="btn_bypass_auth">Bypass Auth</string>
+    <string name="btn_crash_brom">Crash BROM</string>
+    <string name="custom_da_label">Custom DA</string>
+    <string name="custom_preloader_label">Preloader</string>
+    <string name="custom_auth_label">Auth File</string>
+    <string name="reset_loaders_label">Reset DA</string>
+    <string name="vbmeta_dialog_title">Patch VBMeta (AVB 2.0)</string>
+    <string name="meta_dialog_title">Select Preloader META Mode</string>
+    <string name="erase_rpmb_dialog_title">Erase RPMB Security Region?</string>
+    <string name="erase_rpmb_dialog_body">Warning: Wiping RPMB clears hardware replay-protected blocks. Proceed only if you backed up rpmb.bin first.</string>
+    <string name="btn_full_flash">Full Flash (rf)</string>
+    <string name="btn_read_offset">Read Offset</string>
+    <string name="btn_write_offset">Write Offset</string>
+    <string name="btn_erase_range">Erase Range</string>
+    <string name="btn_da_peek">DA Peek</string>
+    <string name="btn_da_poke">DA Poke</string>
+    <string name="btn_dump_efuse">Dump eFuse</string>
+    <string name="btn_dump_footer">Dump Footer</string>
+    <string name="btn_dump_brom">Dump BROM</string>
+    <string name="btn_run_payload">Run Payload</string>
+</resources>

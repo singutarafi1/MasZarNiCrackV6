@@ -1,0 +1,99 @@
+﻿2026-11-17T05:53:14.2474344Z ##[group]Run gradle/actions/setup-gradle@v4
+2026-11-17T05:53:14.2474912Z with:
+2026-11-17T05:53:14.2475153Z   gradle-version: 9.3.1
+2026-11-17T05:53:14.2475406Z   cache-disabled: false
+2026-11-17T05:53:14.2475658Z   cache-read-only: false
+2026-11-17T05:53:14.2475902Z   cache-write-only: false
+2026-11-17T05:53:14.2476161Z   cache-overwrite-existing: false
+2026-11-17T05:53:14.2476429Z   cache-cleanup: on-success
+2026-11-17T05:53:14.2476700Z   gradle-home-cache-includes: caches
+notifications
+
+2026-11-17T05:53:14.2477001Z   add-job-summary: always
+2026-11-17T05:53:14.2477247Z   add-job-summary-as-pr-comment: never
+2026-11-17T05:53:14.2477523Z   dependency-graph: disabled
+2026-11-17T05:53:14.2477821Z   dependency-graph-report-dir: dependency-graph-reports
+2026-11-17T05:53:14.2478172Z   dependency-graph-continue-on-failure: true
+2026-11-17T05:53:14.2478574Z   build-scan-publish: false
+2026-11-17T05:53:14.2478820Z   validate-wrappers: true
+2026-11-17T05:53:14.2479077Z   allow-snapshot-wrappers: false
+2026-11-17T05:53:14.2479450Z   gradle-home-cache-strict-match: false
+2026-11-17T05:53:14.2479727Z   workflow-job-context: null
+2026-11-17T05:53:14.2481704Z   github-token: ***
+2026-11-17T05:53:14.2481954Z env:
+2026-11-17T05:53:14.2482298Z   JAVA_HOME: /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/17.0.21-9/x64
+2026-11-17T05:53:14.2482710Z   JAVA_HOME_17_X64: /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/17.0.21-9/x64
+2026-11-17T05:53:14.2483049Z ##[endgroup]
+2026-11-17T05:53:14.5478749Z Merged default JDK locations into /home/runner/.m2/toolchains.xml
+2026-11-17T05:53:14.5479516Z Preparing cache for cleanup.
+2026-11-17T05:53:14.5481513Z ##[group]Restore Gradle state from cache
+2026-11-17T05:53:14.8053276Z Cache hit for restore-key: gradle-home-v1|Linux-X64|build-android[424a4bde5300e9f9420c13ca248e595f]-e36e4cf5ddc2cde33cf15bc0812bac56afb9cff3
+2026-11-17T05:53:16.1972256Z Received 0 of 43067965 (0.0%), 0.0 MBs/sec
+2026-11-17T05:53:16.9886866Z Received 43067965 of 43067965 (100.0%), 22.9 MBs/sec
+2026-11-17T05:53:16.9887423Z Cache Size: ~41 MB (43067965 B)
+2026-11-17T05:53:16.9908542Z [command]/usr/bin/tar -xf /home/runner/work/_temp/be07a22a-8296-4d99-bad7-a0591cebb5d7/cache.tzst -P -C /home/runner/work/MasZarNiCrack/MasZarNiCrack --use-compress-program unzstd
+2026-11-17T05:53:17.0635104Z Cache restored successfully
+2026-11-17T05:53:17.0654089Z Restored cache entry with key gradle-home-v1|Linux-X64|build-android[424a4bde5300e9f9420c13ca248e595f]-50cbad0e10b630fde3a9dd2186a271137fdd9486 to /home/runner/.gradle/caches,/home/runner/.gradle/notifications,/home/runner/.gradle/.setup-gradle in 2516ms
+2026-11-17T05:53:17.3111843Z Cache hit for: gradle-groovy-dsl-v1-28b9a41f693ba754e53f6f5a3dfc445c
+2026-11-17T05:53:17.3146794Z Cache hit for: gradle-kotlin-dsl-v1-2093bc1f44b679c84baac9d24e4acd97
+2026-11-17T05:53:17.3227745Z Cache hit for: gradle-instrumented-jars-v1-da27189608cc64b8ccdc1e8234084779
+2026-11-17T05:53:17.3269885Z Cache hit for: gradle-dependencies-v1-ffb48bdf92e346133b3903f857429619
+2026-11-17T05:53:17.3297631Z Cache hit for: gradle-generated-gradle-jars-v1-cb4b032a7d08b9bf1e84e9eacaebcc29
+2026-11-17T05:53:17.3438383Z Cache hit for: gradle-transforms-v1-4e63ff794f6f86562bc9375d099b423a
+2026-11-17T05:53:18.1263486Z Received 91760 of 91760 (100.0%), 0.2 MBs/sec
+2026-11-17T05:53:18.1264238Z Cache Size: ~0 MB (91760 B)
+2026-11-17T05:53:18.1277782Z [command]/usr/bin/tar -xf /home/runner/work/_temp/dfff1ad4-fb16-4e18-9123-b426b86a3917/cache.tzst -P -C /home/runner/work/MasZarNiCrack/MasZarNiCrack --use-compress-program unzstd
+2026-11-17T05:53:18.1364048Z Cache restored successfully
+2026-11-17T05:53:18.1365170Z Restored cache entry with key gradle-groovy-dsl-v1-28b9a41f693ba754e53f6f5a3dfc445c to /home/runner/.gradle/caches/*/groovy-dsl/*/ in 1070ms
+2026-11-17T05:53:18.1370830Z Received 60498 of 60498 (100.0%), 0.1 MBs/sec
+2026-11-17T05:53:18.1371217Z Cache Size: ~0 MB (60498 B)
+2026-11-17T05:53:18.1385706Z [command]/usr/bin/tar -xf /home/runner/work/_temp/c5378f6e-8f1c-4d78-8c24-262610210654/cache.tzst -P -C /home/runner/work/MasZarNiCrack/MasZarNiCrack --use-compress-program unzstd
+2026-11-17T05:53:18.1445972Z Cache restored successfully
+2026-11-17T05:53:18.1446918Z Restored cache entry with key gradle-instrumented-jars-v1-da27189608cc64b8ccdc1e8234084779 to /home/runner/.gradle/caches/jars-*/*/ in 1078ms
+2026-11-17T05:53:18.1503205Z Received 91873 of 91873 (100.0%), 0.2 MBs/sec
+2026-11-17T05:53:18.1503652Z Cache Size: ~0 MB (91873 B)
+2026-11-17T05:53:18.1513210Z [command]/usr/bin/tar -xf /home/runner/work/_temp/18f86cdc-1655-4ac4-b9db-d01559c53160/cache.tzst -P -C /home/runner/work/MasZarNiCrack/MasZarNiCrack --use-compress-program unzstd
+2026-11-17T05:53:18.1635859Z Cache restored successfully
+2026-11-17T05:53:18.1636770Z Restored cache entry with key gradle-kotlin-dsl-v1-2093bc1f44b679c84baac9d24e4acd97 to /home/runner/.gradle/caches/*/kotlin-dsl/accessors/*/,/home/runner/.gradle/caches/*/kotlin-dsl/scripts/*/ in 1097ms
+2026-11-17T05:53:18.6647255Z Received 0 of 367781125 (0.0%), 0.0 MBs/sec
+2026-11-17T05:53:18.6707925Z Received 0 of 41993404 (0.0%), 0.0 MBs/sec
+2026-11-17T05:53:18.6896877Z Received 0 of 206707023 (0.0%), 0.0 MBs/sec
+2026-11-17T05:53:19.4628758Z Received 41993404 of 41993404 (100.0%), 22.3 MBs/sec
+2026-11-17T05:53:19.4629755Z Cache Size: ~40 MB (41993404 B)
+2026-11-17T05:53:19.4778031Z [command]/usr/bin/tar -xf /home/runner/work/_temp/febbadda-b052-42d6-b7e0-9550998cd9cd/cache.tzst -P -C /home/runner/work/MasZarNiCrack/MasZarNiCrack --use-compress-program unzstd
+2026-11-17T05:53:19.6647445Z Received 54525952 of 367781125 (14.8%), 26.0 MBs/sec
+2026-11-17T05:53:19.6885157Z Cache restored successfully
+2026-11-17T05:53:19.6897375Z Received 96468992 of 206707023 (46.7%), 46.0 MBs/sec
+2026-11-17T05:53:19.6901895Z Restored cache entry with key gradle-generated-gradle-jars-v1-cb4b032a7d08b9bf1e84e9eacaebcc29 to /home/runner/.gradle/caches/9.3.1/generated-gradle-jars/gradle-api-9.3.1.jar in 2625ms
+2026-11-17T05:53:20.6637174Z Received 150994944 of 367781125 (41.1%), 48.0 MBs/sec
+2026-11-17T05:53:20.6906459Z Received 197132288 of 206707023 (95.4%), 62.7 MBs/sec
+2026-11-17T05:53:20.8783412Z Received 206707023 of 206707023 (100.0%), 61.9 MBs/sec
+2026-11-17T05:53:20.8784305Z Cache Size: ~197 MB (206707023 B)
+2026-11-17T05:53:20.8943978Z [command]/usr/bin/tar -xf /home/runner/work/_temp/dd05073d-2303-4d43-926d-3acdb97b04d3/cache.tzst -P -C /home/runner/work/MasZarNiCrack/MasZarNiCrack --use-compress-program unzstd
+2026-11-17T05:53:21.6641633Z Received 247463936 of 367781125 (67.3%), 59.0 MBs/sec
+2026-11-17T05:53:21.6643981Z Cache restored successfully
+2026-11-17T05:53:21.6710314Z Restored cache entry with key gradle-transforms-v1-4e63ff794f6f86562bc9375d099b423a to /home/runner/.gradle/caches/transforms-4/*/,/home/runner/.gradle/caches/*/transforms/*/ in 4604ms
+2026-11-17T05:53:22.6645157Z Received 322961408 of 367781125 (87.8%), 61.6 MBs/sec
+2026-11-17T05:53:23.6647206Z Received 363586821 of 367781125 (98.9%), 57.8 MBs/sec
+2026-11-17T05:53:23.7828054Z Received 367781125 of 367781125 (100.0%), 57.3 MBs/sec
+2026-11-17T05:53:23.7828680Z Cache Size: ~351 MB (367781125 B)
+2026-11-17T05:53:23.7902130Z [command]/usr/bin/tar -xf /home/runner/work/_temp/78b49f9b-40bb-4a6f-b4f2-693c171b448e/cache.tzst -P -C /home/runner/work/MasZarNiCrack/MasZarNiCrack --use-compress-program unzstd
+2026-11-17T05:53:24.0613592Z Cache restored successfully
+2026-11-17T05:53:24.0748427Z Restored cache entry with key gradle-dependencies-v1-ffb48bdf92e346133b3903f857429619 to /home/runner/.gradle/caches/modules-*/files-*/*/*/*/* in 7008ms
+2026-11-17T05:53:24.0840155Z ##[endgroup]
+2026-11-17T05:53:24.0880696Z ##[group]All Gradle Wrapper jars are valid
+2026-11-17T05:53:24.0881739Z 
+2026-11-17T05:53:24.0882140Z ##[endgroup]
+2026-11-17T05:53:24.1522330Z ##[group]Provision Gradle 9.3.1
+2026-11-17T05:53:27.7965572Z Cache hit for: gradle-9.3.1
+2026-11-17T05:53:28.8808326Z Received 79691776 of 136943103 (58.2%), 75.9 MBs/sec
+2026-11-17T05:53:29.8812262Z Received 134217728 of 136943103 (98.0%), 64.0 MBs/sec
+2026-11-17T05:53:30.6907383Z Received 136943103 of 136943103 (100.0%), 46.5 MBs/sec
+2026-11-17T05:53:30.6909438Z Cache Size: ~131 MB (136943103 B)
+2026-11-17T05:53:30.7036892Z [command]/usr/bin/tar -xf /home/runner/work/_temp/2e620e99-9ede-4205-8d10-0044d8045a9f/cache.tzst -P -C /home/runner/work/MasZarNiCrack/MasZarNiCrack --use-compress-program unzstd
+2026-11-17T05:53:30.7892882Z Cache restored successfully
+2026-11-17T05:53:30.7936119Z Restored Gradle distribution gradle-9.3.1 from cache to /home/runner/work/_temp/.gradle-actions/gradle-installations/downloads/gradle-9.3.1-bin.zip
+2026-11-17T05:53:30.7946801Z [command]/usr/bin/unzip -o -q /home/runner/work/_temp/.gradle-actions/gradle-installations/downloads/gradle-9.3.1-bin.zip
+2026-11-17T05:53:31.6272804Z Extracted Gradle 9.3.1 to /home/runner/work/_temp/.gradle-actions/gradle-installations/installs/gradle-9.3.1
+2026-11-17T05:53:31.6274678Z Provisioned Gradle executable /home/runner/work/_temp/.gradle-actions/gradle-installations/installs/gradle-9.3.1/bin/gradle
+2026-11-17T05:53:31.6275725Z ##[endgroup]

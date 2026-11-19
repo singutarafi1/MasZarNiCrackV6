@@ -1,0 +1,8 @@
+2026-11-17T05:52:42.0550000Z Requested labels: ubuntu-latest
+2026-11-17T05:52:42.0550000Z Job defined at: singutarafi1/MasZarNiCrack/.github/workflows/build.yml@refs/heads/main
+2026-11-17T05:52:42.0550000Z Waiting for a runner to pick up this job...
+2026-11-17T05:52:42.0650000Z Job is waiting for a hosted runner to come online.
+2026-11-17T05:52:42.0630000Z Job is about to start running on the hosted runner: GitHub Actions 1000000133
+2026-11-17T05:52:42.0550000Z Evaluating build-android.if
+2026-11-17T05:52:42.0550000Z Evaluating: success()
+2026-11-17T05:52:42.0550000Z Result: true

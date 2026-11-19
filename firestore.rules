@@ -1,0 +1,194 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Pillar 1: Global Default-Deny Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 6 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Validation Blueprint for LicenseKey
+    function isValidLicenseKey(data) {
+      return data.keys().hasAll([
+               'keyCode',
+               'durationDays',
+               'durationLabel',
+               'status',
+               'createdByUid',
+               'boundHwid',
+               'redeemedByUid',
+               'signatureHex',
+               'createdAt',
+               'updatedAt'
+             ]) &&
+             data.keys().hasOnly([
+               'keyCode',
+               'durationDays',
+               'durationLabel',
+               'status',
+               'createdByUid',
+               'boundHwid',
+               'redeemedByUid',
+               'signatureHex',
+               'createdAt',
+               'updatedAt'
+             ]) &&
+             data.keyCode is string && data.keyCode.size() >= 10 && data.keyCode.size() <= 64 &&
+             data.durationDays is int && data.durationDays >= 1 && data.durationDays <= 36500 &&
+             data.durationLabel is string && data.durationLabel.size() >= 1 && data.durationLabel.size() <= 40 &&
+             data.status is string && (data.status == 'UNUSED' || data.status == 'USED' || data.status == 'REVOKED') &&
+             data.createdByUid is string && data.createdByUid.size() >= 1 && data.createdByUid.size() <= 128 &&
+             data.boundHwid is string && data.boundHwid.size() <= 128 &&
+             data.redeemedByUid is string && data.redeemedByUid.size() <= 128 &&
+             data.signatureHex is string && data.signatureHex.size() >= 16 && data.signatureHex.size() <= 128 &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    // Action 1: Redeeming an UNUSED one-time key (or re-verifying on the same boundHwid)
+    function isRedeemAction() {
+      return existing().status == 'UNUSED' &&
+             incoming().status == 'USED' &&
+             incoming().boundHwid.size() >= 6 &&
+             incoming().redeemedByUid == request.auth.uid &&
+             incoming().keyCode == existing().keyCode &&
+             incoming().durationDays == existing().durationDays &&
+             incoming().durationLabel == existing().durationLabel &&
+             incoming().createdByUid == existing().createdByUid &&
+             incoming().signatureHex == existing().signatureHex &&
+             incoming().createdAt == existing().createdAt &&
+             incoming().diff(existing()).affectedKeys().hasOnly(['status', 'boundHwid', 'redeemedByUid', 'updatedAt']);
+    }
+
+    // Action 2: Creator / Admin managing key status (Reset to UNUSED or REVOKE)
+    function isCreatorManageAction() {
+      return existing().createdByUid == request.auth.uid &&
+             incoming().keyCode == existing().keyCode &&
+             incoming().durationDays == existing().durationDays &&
+             incoming().durationLabel == existing().durationLabel &&
+             incoming().createdByUid == existing().createdByUid &&
+             incoming().signatureHex == existing().signatureHex &&
+             incoming().createdAt == existing().createdAt &&
+             incoming().diff(existing()).affectedKeys().hasOnly(['status', 'boundHwid', 'redeemedByUid', 'updatedAt']);
+    }
+
+    match /license_keys/{keyId} {
+      // Any authenticated user can look up a specific key by its exact keyCode ID to redeem it
+      allow get: if isSignedIn() && isValidId(keyId);
+
+      // List queries must filter by createdByUid == request.auth.uid
+      allow list: if isSignedIn() && existing().createdByUid == request.auth.uid;
+
+      // Create: Authenticated creator can register a new unused key OR self-redeem a C++ MasterKey-signed key
+      allow create: if isSignedIn() &&
+                       isValidId(keyId) &&
+                       isValidLicenseKey(incoming()) &&
+                       incoming().keyCode == keyId &&
+                       incoming().createdByUid == request.auth.uid &&
+                       (
+                         (incoming().status == 'UNUSED' && incoming().boundHwid == '' && incoming().redeemedByUid == '') ||
+                         (incoming().status == 'USED' && incoming().boundHwid.size() >= 6 && incoming().redeemedByUid == request.auth.uid)
+                       );
+
+      // Update: Must satisfy validation helper first, then either Redeem Action or Creator Manage Action
+      allow update: if isSignedIn() &&
+                       isValidId(keyId) &&
+                       isValidLicenseKey(incoming()) &&
+                       (isRedeemAction() || isCreatorManageAction());
+
+      // Delete: Only the creator of the key can delete it
+      allow delete: if isSignedIn() &&
+                       isValidId(keyId) &&
+                       existing().createdByUid == request.auth.uid;
+    }
+
+    // Validation Blueprint for UserAccount
+    function isValidUserAccount(data) {
+      return data.keys().hasAll([
+               'email',
+               'username',
+               'passwordHash',
+               'passwordSalt',
+               'hwid',
+               'deviceModel',
+               'activeKeyCode',
+               'durationDays',
+               'expiryEpochSec',
+               'offlineCert',
+               'status',
+               'authUid',
+               'createdAt',
+               'updatedAt'
+             ]) &&
+             data.keys().hasOnly([
+               'email',
+               'username',
+               'passwordHash',
+               'passwordSalt',
+               'hwid',
+               'deviceModel',
+               'activeKeyCode',
+               'durationDays',
+               'expiryEpochSec',
+               'offlineCert',
+               'status',
+               'authUid',
+               'createdAt',
+               'updatedAt'
+             ]) &&
+             data.email is string && data.email.size() >= 5 && data.email.size() <= 128 &&
+             data.username is string && data.username.size() >= 2 && data.username.size() <= 64 &&
+             data.passwordHash is string && data.passwordHash.size() >= 32 && data.passwordHash.size() <= 128 &&
+             data.passwordSalt is string && data.passwordSalt.size() >= 8 && data.passwordSalt.size() <= 64 &&
+             data.hwid is string && data.hwid.size() >= 6 && data.hwid.size() <= 128 &&
+             data.deviceModel is string && data.deviceModel.size() >= 1 && data.deviceModel.size() <= 128 &&
+             data.activeKeyCode is string && data.activeKeyCode.size() >= 10 && data.activeKeyCode.size() <= 64 &&
+             data.durationDays is int && data.durationDays >= 1 && data.durationDays <= 36500 &&
+             data.expiryEpochSec is int && data.expiryEpochSec >= 0 &&
+             data.offlineCert is string && data.offlineCert.size() >= 16 && data.offlineCert.size() <= 128 &&
+             data.status is string && (data.status == 'ACTIVE' || data.status == 'REVOKED') &&
+             data.authUid is string && data.authUid.size() >= 1 && data.authUid.size() <= 128 &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    match /user_accounts/{accountId} {
+      // Authenticated user can read their account by docId
+      allow get: if isSignedIn() && isValidId(accountId);
+
+      // Authenticated user can create their account document
+      allow create: if isSignedIn() &&
+                       isValidId(accountId) &&
+                       isValidUserAccount(incoming()) &&
+                       incoming().authUid == request.auth.uid;
+
+      // Authenticated user can update their account document
+      allow update: if isSignedIn() &&
+                       isValidId(accountId) &&
+                       isValidUserAccount(incoming()) &&
+                       (incoming().authUid == request.auth.uid || existing().authUid == request.auth.uid);
+
+      // Delete only by owner
+      allow delete: if isSignedIn() &&
+                       isValidId(accountId) &&
+                       existing().authUid == request.auth.uid;
+    }
+  }
+}

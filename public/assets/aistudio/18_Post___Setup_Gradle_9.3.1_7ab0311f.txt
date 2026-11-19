@@ -1,0 +1,21 @@
+﻿2026-11-17T05:53:54.7963822Z Post job cleanup.
+2026-11-17T05:53:54.9733343Z In post-action step
+2026-11-17T05:53:54.9742095Z ##[group]Stopping Gradle daemons
+2026-11-17T05:53:54.9742694Z Stopping Gradle daemons for /home/runner/work/_temp/.gradle-actions/gradle-installations/installs/gradle-9.3.1
+2026-11-17T05:53:54.9752863Z [command]/home/runner/work/_temp/.gradle-actions/gradle-installations/installs/gradle-9.3.1/bin/gradle --stop
+2026-11-17T05:53:55.4659317Z Stopping Daemon(s)
+2026-11-17T05:53:55.4661005Z 1 Daemon stopped
+2026-11-17T05:53:55.4754390Z ##[endgroup]
+2026-11-17T05:53:55.4755830Z Not performing cache-cleanup due to build failure
+2026-11-17T05:53:55.4756918Z ##[group]Caching Gradle state
+2026-11-17T05:53:55.4919291Z Not saving configuration-cache state, as no encryption key was provided
+2026-11-17T05:53:55.7363994Z [command]/usr/bin/tar --posix -cf cache.tzst --exclude cache.tzst -P -C /home/runner/work/MasZarNiCrack/MasZarNiCrack --files-from manifest.txt --use-compress-program zstdmt
+2026-11-17T05:53:56.7543443Z Sent 96528 of 96528 (100.0%), 0.1 MBs/sec
+2026-11-17T05:53:57.0643154Z Saved cache entry with key gradle-kotlin-dsl-v1-5e492216b903bf2728d6f1e19d2e53cf from /home/runner/.gradle/caches/*/kotlin-dsl/accessors/*/,/home/runner/.gradle/caches/*/kotlin-dsl/scripts/*/ in 1353ms
+2026-11-17T05:53:57.0762295Z [command]/usr/bin/tar --posix -cf cache.tzst --exclude cache.tzst -P -C /home/runner/work/MasZarNiCrack/MasZarNiCrack --files-from manifest.txt --use-compress-program zstdmt
+2026-11-17T05:53:58.4440797Z Sent 10747904 of 43091749 (24.9%), 10.3 MBs/sec
+2026-11-17T05:53:59.1686828Z Sent 43091749 of 43091749 (100.0%), 23.8 MBs/sec
+2026-11-17T05:53:59.4439790Z Saved cache entry with key gradle-home-v1|Linux-X64|build-android[424a4bde5300e9f9420c13ca248e595f]-50cbad0e10b630fde3a9dd2186a271137fdd9486 from /home/runner/.gradle/caches,/home/runner/.gradle/notifications,/home/runner/.gradle/.setup-gradle in 2374ms
+2026-11-17T05:53:59.4441298Z ##[endgroup]
+2026-11-17T05:53:59.4446867Z Generating Job Summary
+2026-11-17T05:53:59.4456210Z Completed post-action step

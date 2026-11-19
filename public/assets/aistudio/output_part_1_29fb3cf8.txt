@@ -1,0 +1,2515 @@
+
+==================================================
+FILE: diag.py
+==================================================
+#!/usr/bin/env python3
+"""
+Licensed under MIT License, (c) B. Kerler 2018-2021
+"""
+
+import sys
+import os
+import argparse
+import json
+import logging
+from xml.etree import ElementTree
+from enum import Enum
+
+from struct import unpack, pack
+from binascii import hexlify, unhexlify
+import os, sys, inspect
+
+current_dir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
+
+from edl.Library.utils import print_progress, read_object, write_object, LogBase
+from edl.Library.usblib import UsbClass
+from edl.Library.hdlc import hdlc
+
+from edl.Config.usb_ids import default_diag_vid_pid
+
+qcerror = {
+    1: "None",
+    2: "Unknown",
+    3: "Open Port Fail",
+    4: "Port not open",
+    5: "Buffer too small",
+    6: "Read data fail",
+    7: "Open file fail",
+    8: "File not open",
+    9: "Invalid parameter",
+    10: "Send write ram failed",
+    11: "Send command failed",
+    12: "Offline phone failed",
+    13: "Erase rom failed",
+    14: "Timeout",
+    15: "Go cmd failed",
+    16: "Set baudrate failed",
+    17: "Say hello failed",
+    18: "Write port failed",
+    19: "Failed to read nv",
+    20: "Failed to write nv",
+    21: "Last failed but not recovery",
+    22: "Backup file wasn't found",
+    23: "Incorrect SPC Code",
+    24: "Hello pkt isn't needed",
+    25: "Not active"
+}
+
+diagerror = {
+    20: "Generic error",
+    21: "Bad argument",
+    22: "Data too large",
+    24: "Not connected",
+    25: "Send pkt failed",
+    26: "Receive pkt failed",
+    27: "Extract pkt failed",
+    29: "Open port failed",
+    30: "Bad command",
+    31: "Protected",
+    32: "No media",
+    33: "Empty",
+    34: "List done"
+}
+
+nvitem_type = [
+    ("item", "H"),
+    ("rawdata", "128s"),
+    ("status", "H")
+]
+
+subnvitem_type = [
+    ("item", "H"),
+    ("index", "H"),
+    ("rawdata", "128s"),
+    ("status", "H")
+]
+
+
+class fs_factimage_read_info():
+    def_fs_factimage_read_info = [
+        ("stream_state", "B"),  # 0 indicates no more data to be sent, otherwise set to 1
+        ("info_cluster_sent", "B"),  # 0 indicates if info_cluster was not sent, else 1
+        ("cluster_map_seqno", "H"),  # Sequence number of cluster map pages
+        ("cluster_data_seqno", "I")  # Sequence number of cluster data pages
+    ]
+
+    def __init__(self, stream_state, info_cluster_sent, cluster_map_seqno, cluster_data_seqno):
+        self.stream_state = stream_state
+        self.info_cluster_sent = info_cluster_sent
+        self.cluster_map_seqno = cluster_map_seqno
+        self.cluster_data_seqno = cluster_data_seqno
+
+    def fromdata(self, data):
+        tmp = read_object(data[0:0x10], self.def_fs_factimage_read_info)
+        self.stream_state = tmp["stream_state"]
+        self.info_cluster_sent = tmp["info_cluster_sent"]
+        self.cluster_map_seqno = tmp["cluster_map_seqno"]
+        self.cluster_data_seqno = tmp["cluster_data_seqno"]
+
+    def todata(self):
+        data = write_object(self.def_fs_factimage_read_info, self.stream_state, self.info_cluster_sent,
+                            self.cluster_map_seqno, self.cluster_data_seqno)
+        return data
+
+
+class FactoryHeader():
+    def_factory_header = [
+        ("magic1", "I"),
+        ("magic2", "I"),
+        ("fact_version", "H"),  # Version of this cluster
+        # #Fields needed for the superblock
+        ("version", "H"),  # Superblock version
+        ("block_size", "I"),  # Pages per block.
+        ("page_size", "I"),  # Page size in bytes.
+        ("block_count", "I"),  # Total blocks in device.
+        ("space_limit", "I"),  # Total number of used pages (defines the size of the map)
+        ("upper_data", "32I")
+    ]
+
+    def __init__(self):
+        self.magic1 = 0
+        self.magic2 = 0
+        self.fact_version = 0
+        self.version = 0
+        self.block_size = 0
+        self.page_size = 0
+        self.block_count = 0
+        self.space_limit = 0
+        self.upper_data = [0 * 32]
+
+    def fromdata(self, data):
+        tmp = read_object(data[0:0x9C], self.def_factory_header)
+        self.magic1 = tmp["magic1"]
+        self.magic2 = tmp["magic2"]
+        self.fact_version = tmp["fact_version"]
+        self.version = tmp["version"]
+        self.block_size = tmp["block_size"]
+        self.page_size = tmp["page_size"]
+        self.block_count = tmp["block_count"]
+        self.space_limit = tmp["space_limit"]
+        self.upper_data = tmp["upper_data"]
+
+    def todata(self):
+        data = write_object(self.magic1, self.magic2, self.fact_version, self.version, self.block_size, self.page_size,
+                            self.block_count, self.space_limit, self.upper_data)
+        return data
+
+
+class nvitem():
+    item = 0x0
+    data = b""
+    status = 0x0
+    index = 0x0
+    name = ""
+
+    def __init__(self, item, index, data, status, name):
+        self.item = item
+        self.index = index
+        self.data = data
+        self.status = status
+        self.name = name
+
+
+class diag_cmds(Enum):
+    DIAG_VERNO_F = 0
+    DIAG_ESN_F = 1
+    DIAG_PEEKB_F = 2
+    DIAG_PEEKW_F = 3
+    DIAG_PEEKD_F = 4
+    DIAG_POKEB_F = 5
+    DIAG_POKEW_F = 6
+    DIAG_POKED_F = 7
+    DIAG_OUTP_F = 8
+    DIAG_OUTPW_F = 9
+    DIAG_INP_F = 0xA
+    DIAG_INPW_F = 0xB
+    DIAG_STATUS_F = 0xC
+    DIAG_LOGMASK_F = 0xF
+    DIAG_LOG_F = 0x10
+    DIAG_NV_PEEK_F = 0x11
+    DIAG_NV_POKE_F = 0x12
+    DIAG_BAD_CMD_F = 0x13
+    DIAG_BAD_PARM_F = 0x14
+    DIAG_BAD_LEN_F = 0x15
+    DIAG_BAD_MODE_F = 0x18
+    DIAG_TAGRAPH_F = 0x19
+    DIAG_MARKOV_F = 0x1a
+    DIAG_MARKOV_RESET_F = 0x1b
+    DIAG_DIAG_VER_F = 0x1c
+    DIAG_TS_F = 0x1d
+    DIAG_TA_PARM_F = 0x1E
+    DIAG_MSG_F = 0x1f
+    DIAG_HS_KEY_F = 0x20
+    DIAG_HS_LOCK_F = 0x21
+    DIAG_HS_SCREEN_F = 0x22
+    DIAG_PARM_SET_F = 0x24
+    DIAG_NV_READ_F = 0x26
+    DIAG_NV_WRITE_F = 0x27
+    DIAG_CONTROL_F = 0x29
+    DIAG_ERR_READ_F = 0x2a
+    DIAG_ERR_CLEAR_F = 0x2b
+    DIAG_SER_RESET_F = 0x2c
+    DIAG_SER_REPORT_F = 0x2d
+    DIAG_TEST_F = 0x2e
+    DIAG_GET_DIPSW_F = 0x2f
+    DIAG_SET_DIPSW_F = 0x30
+    DIAG_VOC_PCM_LB_F = 0x31
+    DIAG_VOC_PKT_LB_F = 0x32
+    DIAG_ORIG_F = 0x35
+    DIAG_END_F = 0x36
+    DIAG_SW_VERSION_F = 0x38
+    DIAG_DLOAD_F = 0x3a
+    DIAG_TMOB_F = 0x3b
+    DIAG_STATE_F = 0x3f
+    DIAG_PILOT_SETS_F = 0x40
+    DIAG_SPC_F = 0x41
+    DIAG_BAD_SPC_MODE_F = 0x42
+    DIAG_PARM_GET2_F = 0x43
+    DIAG_SERIAL_CHG_F = 0x44
+    DIAG_PASSWORD_F = 0x46
+    DIAG_BAD_SEC_MODE_F = 0x47
+    DIAG_PR_LIST_WR_F = 0x48
+    DIAG_PR_LIST_RD_F = 0x49
+    DIAG_SUBSYS_CMD_F = 0x4b
+    DIAG_FEATURE_QUERY_F = 0x51
+    DIAG_SMS_READ_F = 0x53
+    DIAG_SMS_WRITE_F = 0x54
+    DIAG_SUP_FER_F = 0x55
+    DIAG_SUP_WALSH_CODES_F = 0x56
+    DIAG_SET_MAX_SUP_CH_F = 0x57
+    DIAG_PARM_GET_IS95B_F = 0x58
+    DIAG_FS_OP_F = 0x59
+    # DIAG_RAM_RW_F = 0x59
+    DIAG_AKEY_VERIFY_F = 0x5A
+    # DIAG_CPU_RW_F = 0x5a
+    DIAG_BMP_HS_SCREEN_F = 0x5b
+    DIAG_CONFIG_COMM_F = 0x5c
+    DIAG_EXT_LOGMASK_F = 0x5d
+    DIAG_EVENT_REPORT_F = 0x60
+    DIAG_STREAMING_CONFIG_F = 0x61
+    DIAG_PARM_RETRIEVE_F = 0x62
+    DIAG_STATUS_SNAPSHOT_F = 0x63
+    DIAG_RPC_F = 0x64
+    DIAG_GET_PROPERTY_F = 0x65
+    DIAG_PUT_PROPERTY_F = 0x66
+    DIAG_GET_GUID_F = 0x67
+    DIAG_USER_CMD_F = 0x68
+    DIAG_GET_PERM_PROPERTY_F = 0x69
+    DIAG_PUT_PERM_PROPERTY_F = 0x6a
+    DIAG_PERM_USER_CMD_F = 0x6b
+    DIAG_GPS_SESS_CTRL_F = 0x6c
+    DIAG_GPS_GRID_F = 0x6d
+    DIAG_GPS_STATISTICS_F = 0x6E
+    DIAG_TUNNEL_F = 0x6f
+    DIAG_MAX_F = 0x70
+    DIAG_SET_FTM_TEST_MODE = 0x72
+    DIAG_EXT_BUILD_ID_F = 0x7c
+
+
+class efs_cmds(Enum):
+    EFS2_DIAG_HELLO = 0  # Parameter negotiation packet
+    EFS2_DIAG_QUERY = 1  # Send information about EFS2 params
+    EFS2_DIAG_OPEN = 2  # Open a file
+    EFS2_DIAG_CLOSE = 3  # Close a file
+    EFS2_DIAG_READ = 4  # Read a file
+    EFS2_DIAG_WRITE = 5  # Write a file
+    EFS2_DIAG_SYMLINK = 6  # Create a symbolic link
+    EFS2_DIAG_READLINK = 7  # Read a symbolic link
+    EFS2_DIAG_UNLINK = 8  # Remove a symbolic link or file
+    EFS2_DIAG_MKDIR = 9  # Create a directory
+    EFS2_DIAG_RMDIR = 10  # Remove a directory
+    EFS2_DIAG_OPENDIR = 11  # Open a directory for reading
+    EFS2_DIAG_READDIR = 12  # Read a directory
+    EFS2_DIAG_CLOSEDIR = 13  # Close an open directory
+    EFS2_DIAG_RENAME = 14  # Rename a file or directory
+    EFS2_DIAG_STAT = 15  # Obtain information about a named file
+    EFS2_DIAG_LSTAT = 16  # Obtain information about a symbolic link
+    EFS2_DIAG_FSTAT = 17  # Obtain information about a file descriptor
+    EFS2_DIAG_CHMOD = 18  # Change file permissions
+    EFS2_DIAG_STATFS = 19  # Obtain file system information
+    EFS2_DIAG_ACCESS = 20  # Check a named file for accessibility
+    EFS2_DIAG_NAND_DEV_INFO = 21  # Get NAND device info
+    EFS2_DIAG_FACT_IMAGE_START = 22  # Start data output for Factory Image
+    EFS2_DIAG_FACT_IMAGE_READ = 23  # Get data for Factory Image
+    EFS2_DIAG_FACT_IMAGE_END = 24  # End data output for Factory Image
+    EFS2_DIAG_PREP_FACT_IMAGE = 25  # Prepare file system for image dump
+    EFS2_DIAG_PUT_DEPRECATED = 26  # Write an EFS item file
+    EFS2_DIAG_GET_DEPRECATED = 27  # Read an EFS item file
+    EFS2_DIAG_ERROR = 28  # Send an EFS Error Packet back through DIAG
+    EFS2_DIAG_EXTENDED_INFO = 29  # Get Extra information.
+    EFS2_DIAG_CHOWN = 30  # Change ownership
+    EFS2_DIAG_BENCHMARK_START_TEST = 31  # Start Benchmark
+    EFS2_DIAG_BENCHMARK_GET_RESULTS = 32  # Get Benchmark Report
+    EFS2_DIAG_BENCHMARK_INIT = 33  # Init/Reset Benchmark
+    EFS2_DIAG_SET_RESERVATION = 34  # Set group reservation
+    EFS2_DIAG_SET_QUOTA = 35  # Set group quota
+    EFS2_DIAG_GET_GROUP_INFO = 36  # Retrieve Q&R values
+    EFS2_DIAG_DELTREE = 37  # Delete a Directory Tree
+    EFS2_DIAG_PUT = 38  # Write a EFS item file in order
+    EFS2_DIAG_GET = 39  # Read a EFS item file in order
+    EFS2_DIAG_TRUNCATE = 40  # Truncate a file by the name
+    EFS2_DIAG_FTRUNCATE = 41  # Truncate a file by a descriptor
+    EFS2_DIAG_STATVFS_V2 = 42  # Obtains extensive file system info
+
+
+O_RDONLY = 0
+O_WRONLY = 1
+O_RDWR = 2
+O_ACCMODE = O_RDONLY | O_WRONLY | O_RDWR
+FS_DIAG_MAX_READ_REQ = 1024
+
+
+# define DIAG_NV_WRITE_F 0x27
+# define DIAG_NV_READ_F 0x26
+
+class qcdiag(metaclass=LogBase):
+    def __init__(self, loglevel, portconfig, ep_in=-1, ep_out=-1):
+        self.portconfig = portconfig
+        self.nvlist = {}
+        self.ep_in = ep_in
+        self.ep_out = ep_out
+        self.__logger.setLevel(loglevel)
+        if loglevel == logging.DEBUG:
+            logfilename = "log.txt"
+            fh = logging.FileHandler(logfilename)
+            self.__logger.addHandler(fh)
+        import os, sys, inspect
+        current_dir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
+
+        nvxml = os.path.join(current_dir, "edl", "Config", "nvitems.xml")
+        e = ElementTree.parse(nvxml).getroot()
+        for atype in e.findall("nv"):
+            name = atype.get("name")
+            identifier = int(atype.get("id"))
+            self.nvlist[identifier] = name
+
+    def prettyprint(self, data):
+        recv = ""
+        plain = ""
+        for i in range(len(data)):
+            inf = "%02X " % data[i]
+            recv += inf
+            if data[i] == 0x0D or data[i] == 0x0A or (0x20 <= data[i] <= 0x9A):
+                plain += chr(data[i])
+            else:
+                plain += " "
+            if ((i + 1) % 16) == 0:
+                recv += "\n"
+                plain += "\n"
+        res = recv + "\n-----------------------------------------------\n"
+        if len(plain.replace(" ", "").replace("\n", "")) > 0:
+            res += plain
+        return res
+
+    def decodestatus(self, data):
+        info = data[0]
+        if info == 0x13:
+            return "Invalid Command Response"
+        elif info == 0x14:
+            return "Invalid parameter Response"
+        elif info == 0x15:
+            return "Invalid packet length Response"
+        elif info == 0x17:
+            return "Send Security Mode"
+        elif info == 0x18:
+            return "Packet not allowed in this mode ( online vs offline )"
+        elif info == 0x42:
+            return "Invalid nv_read/write because SP is locked"
+        elif info == diag_cmds.DIAG_BAD_SEC_MODE_F.value:
+            return "Security privileges required"
+        else:
+            return "Command accepted"
+
+    def connect(self):
+        self.cdc = UsbClass(portconfig=self.portconfig, loglevel=self.__logger.level)
+        self.hdlc = None
+        if self.cdc.connect(self.ep_in, self.ep_out):
+            self.hdlc = hdlc(self.cdc)
+            data = self.hdlc.receive_reply(1)
+            return True
+        return False
+
+    def disconnect(self):
+        self.cdc.close(True)
+
+    def send(self, cmd):
+        if self.hdlc != None:
+            return self.hdlc.send_cmd_np(cmd)
+
+    def cmd_info(self):
+        reply = self.send(b"\x00")
+        return self.prettyprint(reply)
+
+    def enforce_crash(self):
+        # ./diag.py -nvwrite 1027,01 enable adsp log NV_MDSP_MEM_DUMP_ENABLED_I
+        # ./diag.py -nvwrite 4399,01 enable download on reboot NV_DETECT_HW_RESET_I
+        res = self.send(b"\x4B\x25\x03\x00")
+        print(self.decodestatus(res))
+
+    def enter_downloadmode(self):
+        res = self.send(b"\x3A")
+        print(self.decodestatus(res))
+
+    def enter_saharamode(self):
+        self.hdlc.receive_reply()
+        res = self.send(b"\x4b\x65\x01\x00")
+        if res[0]==0x4b:
+            print("Done, switched to edl")
+        else:
+            print("Error switching to edl. Try again.")
+        self.disconnect()
+
+
+    def send_sp(self, sp="FFFFFFFFFFFFFFFFFFFE"):
+        if type(sp) == str:
+            sp = unhexlify(sp)
+        else:
+            sp = bytes(sp)
+        if len(sp) < 8:
+            print("SP length must be 8 bytes")
+            return
+        res = self.send(b"\x46" + sp)
+        if res[0] != 0x46:
+            res = self.send(b"\x25" + sp)
+        elif res[0] == 0x46:
+            if res[1] == 0x0:
+                print("Security Password is wrong")
+            elif res[1] == 0x1:
+                print("Security Password accepted.")
+        elif res[0] != 0x25:
+            print(self.decodestatus(res))
+        return res
+
+    def send_spc(self, spc="303030303030"):
+        if type(spc) == str:
+            spc = unhexlify(spc)
+        else:
+            spc = bytes(spc)
+        if len(spc) < 6:
+            print("SPC length must be 6 bytes")
+            return
+        res = self.send(b"\x41" + spc)
+        if res[0] != 0x41:
+            print(self.decodestatus(res))
+        else:
+            if res[1] == 0x0:
+                print("SPC is wrong")
+            elif res[1] == 0x1:
+                print("SPC accepted.")
+        return res
+
+    def DecodeNVItems(self, nvitem):
+        if nvitem.status == 0x1:
+            return "Internal DMSS use"
+        elif nvitem.status == 0x2:
+            return "Unrecognized command"
+        elif nvitem.status == 0x3:
+            return "NV memory full"
+        elif nvitem.status == 0x4:
+            return "Command failed"
+        elif nvitem.status == 0x5:
+            return "Inactive Item"
+        elif nvitem.status == 0x6:
+            return "Bad Parameter"
+        elif nvitem.status == 0x7:
+            return "Item was read-only"
+        elif nvitem.status == 0x8:
+            return "Item not defined for this target"
+        elif nvitem.status == 0x9:
+            return "No more free memory"
+        elif nvitem.status == 0xA:
+            return "Internal use"
+        elif nvitem.status == 0x0:
+            return "OK"
+        return ""
+
+    def print_nvitem(self, item):
+        res, nvitem = self.read_nvitem(item)
+        if res:
+            info = self.DecodeNVItems(nvitem)
+            if res != False:
+                if nvitem.name != "":
+                    ItemNumber = f"{hex(item)} ({nvitem.name}): "
+                else:
+                    ItemNumber = hex(item) + ": "
+                returnanswer = "NVItem " + ItemNumber + info
+                print(returnanswer)
+                if nvitem.status == 0:
+                    print("-----------------------------------------")
+                    print(self.prettyprint(nvitem.data))
+            else:
+                print(nvitem)
+        else:
+            print(nvitem)
+
+    def print_nvitemsub(self, item, index):
+        res, nvitem = self.read_nvitemsub(item,index)
+        info = self.DecodeNVItems(nvitem)
+        if res != False:
+            if nvitem.name != "":
+                ItemNumber = f"{hex(item),hex(index)} ({nvitem.name}): "
+            else:
+                ItemNumber = hex(item)+","+hex(index) + ": "
+            returnanswer = "NVItem " + ItemNumber + info
+            print(returnanswer)
+            if nvitem.status == 0:
+                print("-----------------------------------------")
+                print(self.prettyprint(nvitem.data))
+        else:
+            print(nvitem)
+
+    def backup_nvitems(self, filename, errorlog=""):
+        nvitems = []
+        pos = 0
+        old = 0
+        errors = ""
+        print("Dumping nvitems 0x0 to 0xFFFF.")
+        for item in range(0, 0xFFFF):
+            prog = int(float(pos) / float(0xFFFF) * float(100))
+            if prog > old:
+                print_progress(prog, 100, prefix="Progress:", suffix=f"Complete, item {hex(item)}", bar_length=50)
+                old = prog
+            res, nvitem = self.read_nvitem(item)
+            if res != False:
+                if nvitem.status != 0x5:
+                    nvitem.status = self.DecodeNVItems(nvitem)
+                    nvitems.append(dict(id=nvitem.item, name=nvitem.name, data=hexlify(nvitem.data).decode("utf-8"),
+                                        status=nvitem.status))
+            else:
+                errors += nvitem + "\n"
+            pos += 1
+        js = json.dumps(nvitems)
+        with open(filename, "w") as write_handle:
+            write_handle.write(js)
+        if errorlog == "":
+            print(errors)
+        else:
+            with open(errorlog, "w") as write_handle:
+                write_handle.write(errors)
+        print("Done.")
+
+    def unpackdata(self,data):
+        rlen = len(data)
+        idx = rlen - 1
+        for i in range(0, rlen):
+            byte = data[rlen - i - 1]
+            if byte != 0:
+                break
+            idx = rlen - i - 1
+        return data[:idx]
+
+    def read_nvitem(self, item):
+        rawdata = 128 * b"\x00"
+        status = 0x0000
+        nvrequest = b"\x26" + write_object(nvitem_type, item, rawdata, status)["raw_data"]
+        data = self.send(nvrequest)
+        if len(data) == 0:
+            data = self.send(nvrequest)
+        if len(data) > 0:
+            if data[0] == 0x26:
+                res = read_object(data[1:], nvitem_type)
+                name = ""
+                if item in self.nvlist:
+                    name = self.nvlist[item]
+                data=self.unpackdata(res["rawdata"])
+                res = nvitem(res["item"],0, data, res["status"], name)
+                return [True, res]
+            elif data[0] == 0x14:
+                return [False, f"Error 0x14 trying to read nvitem {hex(item)}."]
+            else:
+                return [False, f"Error {hex(data[0])} trying to read nvitem {hex(item)}."]
+        return [False, f"Empty request for nvitem {hex(item)}"]
+
+    def read_nvitemsub(self, item, index):
+        rawdata = 128 * b"\x00"
+        status = 0x0000
+        nvrequest = b"\x4B\x30\x01\x00" + write_object(subnvitem_type, item, index, rawdata, status)["raw_data"]
+        data = self.send(nvrequest)
+        if len(data) == 0:
+            data = self.send(nvrequest)
+        if len(data) > 0:
+            if data[0] == 0x4B:
+                res = read_object(data[4:], subnvitem_type)
+                name = ""
+                if item in self.nvlist:
+                    name = self.nvlist[item]
+                data=self.unpackdata(res["rawdata"])
+                res = nvitem(res["item"], index, data, res["status"], name)
+                return [True, res]
+            elif data[0] == 0x14:
+                return [False, f"Error 0x14 trying to read nvitem {hex(item)}."]
+            else:
+                return [False, f"Error {hex(data[0])} trying to read nvitem {hex(item)}."]
+        return [False, f"Empty request for nvitem {hex(item)}"]
+
+    def convertimei(self,imei):
+        data=imei[0]+"A"
+        for i in range(1,len(imei),2):
+            data+=imei[i+1]
+            data+=imei[i]
+        return unhexlify("08"+data)
+
+    def write_imei(self,imeis):
+        if "," in imeis:
+            imeis=imeis.split(",")
+        else:
+            imeis=[imeis]
+        index=0
+        for imei in imeis:
+            data=self.convertimei(imei)
+            if index==0:
+                if not self.write_nvitem(550,data):
+                    self.write_nvitemsub(550,index,data)
+            else:
+                self.write_nvitemsub(550,index,data)
+            index+=1
+
+    def write_nvitem(self, item, data):
+        rawdata = bytes(data)
+        while len(rawdata) < 128:
+            rawdata += b"\x00"
+        status = 0x0000
+        nvrequest = b"\x27" + write_object(nvitem_type, item, rawdata, status)["raw_data"]
+        res = self.send(nvrequest)
+        if len(res) > 0:
+            if res[0] == 0x27:
+                res, nvitem = self.read_nvitem(item)
+                if res == False:
+                    print(f"Error while writing nvitem {hex(item)} data, %s" % data)
+                else:
+                    if nvitem.data != data:
+                        print(f"Error while writing nvitem {hex(item)} data, verified data doesn't match")
+                    else:
+                        print(f"Successfully wrote nvitem {hex(item)}.")
+                        return True
+                return False
+            else:
+                print(f"Error while writing nvitem {hex(item)} data, %s" % data)
+
+    def write_nvitemsub(self, item, index, data):
+        rawdata = bytes(data)
+        while len(rawdata) < 128:
+            rawdata += b"\x00"
+        status = 0x0000
+        nvrequest = b"\x4B\x30\x02\x00" + write_object(subnvitem_type, item, index, rawdata, status)["raw_data"]
+        res = self.send(nvrequest)
+        if len(res) > 0:
+            if res[0] == 0x4B:
+                res, nvitem = self.read_nvitemsub(item,index)
+                if res == False:
+                    print(f"Error while writing nvitem {hex(item)} index {hex(index)} data, %s" % data)
+                else:
+                    if nvitem.data != data:
+                        print(f"Error while writing nvitem {hex(item)} index {hex(index)} data, verified data doesn't match")
+                    else:
+                        print(f"Successfully wrote nvitem {hex(item)} index {hex(index)}.")
+                        return True
+                return False
+            else:
+                print(f"Error while writing nvitem {hex(item)} index {hex(index)} data, %s" % data)
+
+    def efsread(self, filename):
+        alternateefs = b"\x4B\x3E\x19\x00"
+        standardefs = b"\x4B\x13\x19\x00"
+        resp = self.send(alternateefs)
+        if resp[0] == 0x4B:
+            efsmethod = 0x3E
+        else:
+            resp = self.send(standardefs)
+            if resp[0] == 0x4B:
+                efsmethod = 0x13
+            else:
+                print("No known efs method detected for reading.")
+                return
+
+        if filename == "":
+            return False
+        write_handle = open(filename, "wb")
+        if write_handle is None:
+            print("Error on writing file ....")
+            return False
+
+        print("Reading EFS ....")
+        fefs = fs_factimage_read_info(0, 0, 0, 0)
+
+        # EFS Cmd
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_PREP_FACT_IMAGE.value, 0x00)  # prepare factory image
+
+        resp = self.send(buf)
+        if len(resp) == 0:
+            print("Phone does not respond. Maybe another software is blocking the port.")
+            return False
+
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_FACT_IMAGE_START.value,
+                   0x00)  # indicate start read out factory image
+
+        resp = self.send(buf)
+
+        # EFS Cmd
+        buf = pack("<BBBBBBHI", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_FACT_IMAGE_READ.value, 0x00, fefs.stream_state,
+                   fefs.info_cluster_sent,
+                   fefs.cluster_map_seqno, fefs.cluster_data_seqno)
+
+        resp = self.send(buf)
+        if resp == 0 or resp == -1:
+            info = ("Page %08X error !\n" % fefs.cluster_data_seqno)
+            print(info)
+            resp = self.send(buf)
+            if resp == 0 or resp == -1:
+                print("Data Error occured, ") + info
+
+        error = unpack("<I", resp[4:8])[0]
+
+        if (resp[0] == 0x13) or (resp[0] == 0x14) or (resp[0] == 0x15) or (error != 0x0):
+            print("EFS Read not supported by phone. Aborting")
+            write_handle.close()
+            return False
+        elif resp[0] == 0x47:
+            print("Send Security Password (SP) first !")
+            write_handle.close()
+            return False
+
+        efserr = False
+        fh = FactoryHeader()
+        if len(resp) > 0:
+            write_handle.write(resp[0x10:-0x1])
+            fefs.fromdata(resp[0x8:0x10])
+            fh.fromdata(resp[0x10:0x10 + (39 * 4)])
+
+        old = 0
+        print_progress(0, 100, prefix="Progress:", suffix="Complete", bar_length=50)
+        total = fh.block_size * fh.block_count * (fh.page_size // 0x200)
+
+        # Real start
+        for page in range(0, total):
+            # EFS Cmd
+            buf = pack("<BBBBBBHI", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_FACT_IMAGE_READ.value, 0x00,
+                       fefs.stream_state, fefs.info_cluster_sent,
+                       fefs.cluster_map_seqno, fefs.cluster_data_seqno)
+
+            pos = int(page / total * 100)
+            if pos > old:
+                print_progress(pos, 100, prefix="Progress:", suffix="Page %d of %d" % (page, total), bar_length=50)
+                old = pos
+
+            resp = self.send(buf)
+            if resp == 0:
+                resp = self.send(buf)
+
+            if resp == 0 or resp == -1:
+                info = ("Page %08X !\n" % fefs.cluster_data_seqno)
+                print(info)
+                resp = self.send(buf)
+                if resp == 0 or resp == -1:
+                    print("Data Error occured, " + info)
+            else:
+                dlen = len(resp) - 0x11
+                if dlen == 0x200 or dlen == 0x800:
+                    if resp[0x0] == 0x4B:
+                        write_handle.write(resp[0x10:0x10 + dlen])
+                        fefs.fromdata(resp[0x8:0x10])
+                    else:
+                        if (resp[0x0] == 0x13) and (resp[0x1] == 0x62) and (len(resp) > 0x200):
+                            write_handle.write(resp[0x14:-4])
+                            fefs.fromdata(resp[0xc:0x14])
+                            if fefs.stream_state == 0x0:
+                                break
+                        else:
+                            print("EFS Read error : Wrong size recieved at page %X" % page)
+                            efserr = True
+                            break
+
+        print_progress(100, 100, prefix="Progress:", suffix="Complete", bar_length=50)
+
+        buf = bytearray()
+        buf.append(0x4B)
+        buf.append(efsmethod)
+        buf.append(efs_cmds.EFS2_DIAG_FACT_IMAGE_END.value)  # end factory image
+        buf.append(0x00)
+
+        resp = self.send(buf)
+        if len(resp) == 0:
+            print("Phone does not respond. Maybe another software is blocking the port.")
+            return False
+
+        write_handle.close()
+        if efserr == False:
+            print("Successfully read EFS.")
+            return True
+        else:
+            print("Error on reading EFS.")
+            return False
+
+    def send_cmd(self, cmd):
+        cmdtosend = unhexlify(cmd)
+        reply = self.send(cmdtosend)
+        if reply[0] != cmdtosend[0]:
+            print(self.decodestatus(reply))
+        result = self.prettyprint(reply)
+        return result
+
+    def efsdiagerror(self, errcode):
+        if errcode == 0x40000001:
+            print("Inconsistent state.")
+        elif errcode == 0x40000002:
+            print("Invalid seq no.")
+        elif errcode == 0x40000003:
+            print("Directory not open.")
+        elif errcode == 0x40000004:
+            print("Directory entry not found.")
+        elif errcode == 0x40000005:
+            print("Invalid path.")
+        elif errcode == 0x40000006:
+            print("Path too long")
+        elif errcode == 0x40000007:
+            print("Too many open directories.")
+        elif errcode == 0x40000008:
+            print("Invalid directory entry.")
+        elif errcode == 0x40000009:
+            print("Too many open files.")
+        elif errcode == 0x4000000a:
+            print("Unknown filetype")
+        elif errcode == 0x4000000b:
+            print("Not nand falsh")
+        elif errcode == 0x4000000c:
+            print("Unavailable info")
+        else:
+            return 0
+        return -1
+
+    def efs_closedir(self, efsmethod, dirp):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_CLOSEDIR.value, 0x00)  # list efs dir
+        buf += pack("<I", dirp)
+        resp = self.send(buf)
+        diagerror = unpack("<I", resp[0x4:0x8])[0]
+        return self.efsdiagerror(diagerror)
+
+    def efs_opendir(self, efsmethod, path):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_OPENDIR.value, 0x00)  # open efs dir
+        buf += bytes(path, "utf-8") + b"\x00"
+        resp = self.send(buf)
+        if resp[0] != diag_cmds.DIAG_BAD_SEC_MODE_F.value and resp[0] != diag_cmds.DIAG_BAD_LEN_F.value:
+            dirp = unpack("<I", resp[0x4:0x8])[0]
+            diagerror = unpack("<I", resp[0x8:0xC])[0]
+            if self.efsdiagerror(diagerror) != 0:
+                return -1
+            return dirp
+
+    def efslistdir(self, path):
+        alternateefs = b"\x4B\x3E\x00\x00" + b"\x00" * 0x28
+        standardefs = b"\x4B\x13\x00\x00" + b"\x00" * 0x28
+        resp = self.send(alternateefs)
+        if resp[0] == 0x4B:
+            efsmethod = 0x3E
+        else:
+            resp = self.send(standardefs)
+            if resp[0] == 0x4B:
+                efsmethod = 0x13
+            else:
+                print("No known efs method detected for reading.")
+                return
+
+        dirp = self.efs_opendir(efsmethod, path)
+        if dirp == -1:
+            return
+
+        info = ""
+        for seqno in range(1, 0xFFFFFFFF):
+            buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_READDIR.value, 0x00)  # list efs dir
+            buf += pack("<II", dirp, seqno)
+            resp = self.send(buf)
+            if len(resp) > 0:
+                [dirp, seqno, diag_errno, entry_type, mode, size, atime, mtime, ctime] = unpack("<Iiiiiiiii",
+                                                                                                resp[4:4 + (9 * 4)])
+                if entry_type==1:
+                    entry_name = resp[4 + (9 * 4):-1]
+                    info += f"\"{path}{entry_name.decode('utf-8')}\" mode:{hex(mode)}, size:{hex(size)}, atime:{hex(atime)}, mtime:{hex(mtime)}, ctime:{hex(ctime)}\n"
+                elif entry_type==0:
+                    break
+        if self.efs_closedir(efsmethod, dirp) == 0:
+            print("Successfully listed directory")
+        else:
+            print("Error on listing directory")
+        return info
+
+    def efs_open(self, efsmethod, oflag, mode, path):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_OPEN.value, 0x00)  # open efs dir
+        buf += pack("<II", oflag, mode)
+        buf += bytes(path, "utf-8") + b"\x00"
+        resp = self.send(buf)
+        if resp[0] != diag_cmds.DIAG_BAD_SEC_MODE_F.value and resp[0] != diag_cmds.DIAG_BAD_LEN_F.value:
+            fdata = unpack("<i", resp[0x4:0x8])[0]
+            diagerror = unpack("<I", resp[0x8:0xC])[0]
+            if self.efsdiagerror(diagerror) != 0:
+                return -1
+            return fdata
+
+    def efs_close(self, efsmethod, fdata):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_CLOSE.value, 0x00)  # list efs dir
+        buf += pack("<i", fdata)
+        resp = self.send(buf)
+        diag_error = unpack("<I", resp[0x4:0x8])[0]
+        return self.efsdiagerror(diag_error)
+
+    def efs_stat(self, efsmethod, path):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_STAT.value, 0x00)  # open efs file
+        buf += bytes(path, "utf-8") + b"\x00"
+        resp = self.send(buf)
+        if resp[0] != diag_cmds.DIAG_BAD_SEC_MODE_F.value and resp[0] != diag_cmds.DIAG_BAD_LEN_F.value:
+            diag_error = unpack("<I", resp[0x4:0x8])[0]
+            mode = unpack("<I", resp[0x8:0xC])[0]
+            size = unpack("<I", resp[0xC:0x10])[0]
+            nlink = unpack("<I", resp[0x10:0x14])[0]
+            atime = unpack("<I", resp[0x14:0x18])[0]
+            mtime = unpack("<I", resp[0x18:0x1C])[0]
+            ctime = unpack("<I", resp[0x1C:0x20])[0]
+            if self.efsdiagerror(diag_error) != 0:
+                return -1
+            return [mode, size, nlink, atime, mtime, ctime]
+
+    def efs_fstat(self, efsmethod, fdata):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_FSTAT.value, 0x00)  # open efs file
+        buf += pack("<I", fdata)
+        resp = self.send(buf)
+        if resp[0] != diag_cmds.DIAG_BAD_SEC_MODE_F.value and resp[0] != diag_cmds.DIAG_BAD_LEN_F.value:
+            diag_error = unpack("<I", resp[0x4:0x8])[0]
+            mode = unpack("<I", resp[0x8:0xC])[0]
+            size = unpack("<I", resp[0xC:0x10])[0]
+            nlink = unpack("<I", resp[0x10:0x14])[0]
+            atime = unpack("<I", resp[0x14:0x18])[0]
+            mtime = unpack("<I", resp[0x18:0x1C])[0]
+            ctime = unpack("<I", resp[0x1C:0x20])[0]
+            if self.efsdiagerror(diag_error) != 0:
+                return -1
+            return [mode, size, nlink, atime, mtime, ctime]
+
+    def efs_lstat(self, efsmethod, path):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_LSTAT.value, 0x00)  # open efs file
+        buf += bytes(path, "utf-8") + b"\x00"
+        resp = self.send(buf)
+        if resp[0] != diag_cmds.DIAG_BAD_SEC_MODE_F.value and resp[0] != diag_cmds.DIAG_BAD_LEN_F.value:
+            diag_error = unpack("<I", resp[0x4:0x8])[0]
+            mode = unpack("<I", resp[0x8:0xC])[0]
+            atime = unpack("<I", resp[0xC:0x10])[0]
+            mtime = unpack("<I", resp[0x10:0x14])[0]
+            ctime = unpack("<I", resp[0x14:0x18])[0]
+            if self.efsdiagerror(diag_error) != 0:
+                return -1
+            return [mode, atime, mtime, ctime]
+
+    def efs_get(self, efsmethod, path, data_length, sequence_number):
+        path_length = len(path) + 1
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_GET.value, 0x00)  # open efs file
+        buf += pack("<IIH", data_length, path_length, sequence_number)
+        buf += bytes(path, "utf-8") + b"\x00"
+        resp = self.send(buf)
+        if resp[0] != diag_cmds.DIAG_BAD_SEC_MODE_F.value and resp[0] != diag_cmds.DIAG_BAD_LEN_F.value:
+            num_bytes = unpack("<I", resp[0x4:0x8])[0]
+            diag_error = unpack("<I", resp[0x8:0xC])[0]
+            seq_no = unpack("<H", resp[0xC:0xE])[0]
+            data = resp[0xE:]
+            if self.efsdiagerror(diag_error) != 0:
+                return -1
+            return [num_bytes, seq_no, data]
+
+    def efs_write(self, efsmethod, fdata, offset, data):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_WRITE.value, 0x00)  # open efs file
+        buf += pack("<II", fdata, offset)
+        buf += data
+        resp = self.send(buf)
+        if resp[0] != diag_cmds.DIAG_BAD_SEC_MODE_F.value and resp[0] != diag_cmds.DIAG_BAD_LEN_F.value:
+            fdata = unpack("<i", resp[0x4:0x8])[0]
+            offset = unpack("<I", resp[0x8:0xC])[0]
+            bytes_written = unpack("<I", resp[0xC:0x10])[0]
+            diag_error = unpack("<I", resp[0x10:0x14])[0]
+            if self.efsdiagerror(diag_error) != 0:
+                return -1
+            return [fdata, offset, bytes_written]
+
+    def handle_error(self, resp):
+        if resp[0] != diag_cmds.DIAG_BAD_SEC_MODE_F.value and resp[0] != diag_cmds.DIAG_BAD_LEN_F.value:
+            diagerror = unpack("<I", resp[0x4:0x8])[0]
+            if self.efsdiagerror(diagerror) != 0:
+                return -1
+            return 0
+
+    def efs_rmdir(self, efsmethod, path):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_RMDIR.value, 0x00)  # open efs file
+        buf += bytes(path, "utf-8") + b"\x00"
+        resp = self.send(buf)
+        return self.handle_error(resp)
+
+    def efs_unlink(self, efsmethod, path):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_UNLINK.value, 0x00)  # open efs file
+        buf += bytes(path, "utf-8") + b"\x00"
+        resp = self.send(buf)
+        return self.handle_error(resp)
+
+    def efs_chown(self, efsmethod, uid_val, gid_val, path):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_CHOWN.value, 0x00)  # open efs file
+        buf += pack("<ii", uid_val, gid_val)
+        buf += bytes(path, "utf-8") + b"\x00"
+        resp = self.send(buf)
+        return self.handle_error(resp)
+
+    def efs_chmod(self, efsmethod, mode, path):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_CHMOD.value, 0x00)  # open efs file
+        buf += pack("<H", mode)
+        buf += bytes(path, "utf-8") + b"\x00"
+        resp = self.send(buf)
+        return self.handle_error(resp)
+
+    def efs_mkdir(self, efsmethod, mode, path):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_MKDIR.value, 0x00)  # open efs file
+        buf += pack("<H", mode)
+        buf += bytes(path, "utf-8") + b"\x00"
+        resp = self.send(buf)
+        return self.handle_error(resp)
+
+    def efs_read(self, efsmethod, fdata, nbytes, offset):
+        buf = pack("<BBBB", 0x4B, efsmethod, efs_cmds.EFS2_DIAG_WRITE.value, 0x00)  # open efs file
+        buf += pack("<III", fdata, nbytes, offset)
+        resp = self.send(buf)
+        if resp[0] != diag_cmds.DIAG_BAD_SEC_MODE_F.value and resp[0] != diag_cmds.DIAG_BAD_LEN_F.value:
+            fdata = unpack("<i", resp[0x4:0x8])[0]
+            offset = unpack("<I", resp[0x8:0xC])[0]
+            bytes_read = unpack("<I", resp[0xC:0x10])[0]
+            diag_error = unpack("<I", resp[0x10:0x14])[0]
+            data = resp[0x14:]
+            if self.efsdiagerror(diag_error) != 0:
+                return -1
+            return [fdata, offset, bytes_read, data]
+
+    def efsreadfile(self, srcpath, dstpath):
+        alternateefs = b"\x4B\x3E\x00\x00" + b"\x00" * 0x28
+        standardefs = b"\x4B\x13\x00\x00" + b"\x00" * 0x28
+        resp = self.send(alternateefs)
+        if resp[0] == 0x4B:
+            efsmethod = 0x3E
+        else:
+            resp = self.send(standardefs)
+            if resp[0] == 0x4B:
+                efsmethod = 0x13
+            else:
+                logging.error("No known efs method detected for reading.")
+                return 0
+
+        fdata = self.efs_open(efsmethod, O_RDONLY, 0, srcpath)
+        if fdata == -1:
+            return 0
+        mode, size, nlink, atime, mtime, ctime = self.efs_fstat(efsmethod, fdata)
+        if size == 0:
+            self.efs_close(efsmethod, fdata)
+            return 0
+        acr = (mode & O_ACCMODE)
+        if acr == O_WRONLY:
+            logging.error("File can only be written. Aborting.")
+            self.efs_close(efsmethod, fdata)
+            return 0
+
+        num_bytes = 0
+        offset = 0
+        fname = srcpath[srcpath.rfind("/") + 1:]
+        fname = os.path.join(dstpath, fname)
+        with open(fname, "wb") as write_handle:
+            dataleft = size
+            while dataleft > 0:
+                rsize = dataleft
+                if rsize > FS_DIAG_MAX_READ_REQ:
+                    rsize = FS_DIAG_MAX_READ_REQ
+                finfo = self.efs_read(efsmethod, fdata, rsize, offset)
+                if finfo == -1:
+                    break
+                fdata, offset, bytes_read, data = finfo
+                write_handle.write(data)
+                offset += rsize
+                dataleft -= rsize
+        self.efs_close(efsmethod, fdata)
+        return num_bytes
+
+    def efswritefile(self, srcpath, dstpath):
+        alternateefs = b"\x4B\x3E\x00\x00" + b"\x00" * 0x28
+        standardefs = b"\x4B\x13\x00\x00" + b"\x00" * 0x28
+        resp = self.send(alternateefs)
+        if resp[0] == 0x4B:
+            efsmethod = 0x3E
+        else:
+            resp = self.send(standardefs)
+            if resp[0] == 0x4B:
+                efsmethod = 0x13
+            else:
+                logging.error("No known efs method detected for reading.")
+                return 0
+        with open(srcpath, "rb") as rf:
+            fdata = self.efs_open(efsmethod, O_RDONLY, 0, srcpath)
+            if fdata == -1:
+                return 0
+            mode, size, nlink, atime, mtime, ctime = self.efs_fstat(efsmethod, fdata)
+            if size == 0:
+                self.efs_close(efsmethod, fdata)
+                return 0
+            """
+            acr=(mode & O_ACCMODE)
+            if acr==O_RDONLY:
+                print("File can only be read. Aborting.")
+                self.efs_close(efsmethod, fdata)
+                return
+            """
+            num_bytes = 0
+            offset = 0
+            size = os.fstat(srcpath).st_size
+            dataleft = size
+            while dataleft > 0:
+                rsize = dataleft
+                if rsize > FS_DIAG_MAX_READ_REQ:
+                    rsize = FS_DIAG_MAX_READ_REQ
+                data = rf.read(rsize)
+                finfo = self.efs_write(efsmethod, fdata, offset, data)
+                if finfo == -1:
+                    break
+                fdata, offset, bytes_written = finfo
+                offset += rsize
+                dataleft -= rsize
+            self.efs_close(efsmethod, fdata)
+        return num_bytes
+
+
+class DiagTools(metaclass=LogBase):
+    def run(self, args):
+        self.interface = -1
+        self.vid = None
+        self.pid = None
+
+        if args.vid != "":
+            self.vid = int(args.vid, 16)
+        if args.pid != "":
+            self.pid = int(args.pid, 16)
+        if args.interface != "":
+            self.interface = int(args.interface, 16)
+
+        logfilename = "diag.txt"
+        if args.debugmode:
+            if os.path.exists(logfilename):
+                os.remove(logfilename)
+            fh = logging.FileHandler(logfilename)
+            self.__logger.addHandler(fh)
+            self.__logger.setLevel(logging.DEBUG)
+        else:
+            self.__logger.setLevel(logging.INFO)
+
+        connected = False
+        diag = None
+        if self.vid is None or self.pid is None:
+            diag = qcdiag(loglevel=self.__logger.level, portconfig=default_diag_vid_pid)
+            connected = diag.connect()
+        else:
+            diag = qcdiag(loglevel=self.__logger.level, portconfig=[[self.vid, self.pid, self.interface]])
+            connected = diag.connect()
+        if connected:
+            cmd = args.cmd
+            if cmd=="sp":
+                diag.send_sp(args.spval)
+            elif cmd=="spc":
+                diag.send_spc(args.spcval)
+            elif cmd=="cmd":
+                if args.cmdval=="":
+                    print("cmd needed as hex string, example: 00")
+                else:
+                    print(diag.send_cmd(args.cmdval))
+            elif cmd=="info":
+                print(diag.cmd_info())
+            elif cmd=="download":
+                diag.enter_downloadmode()
+            elif cmd=="sahara":
+                diag.enter_saharamode()
+            elif cmd=="crash":
+                diag.enforce_crash()
+            elif cmd=="efslistdir":
+                print(diag.efslistdir(args.path))
+            elif cmd=="efsreadfile":
+                if args.src=="" or args.dst=="":
+                    print("Usage: -efsreadfile -src srcfile -dst dstfile")
+                    sys.exit()
+                print(diag.efsreadfile(args.src,args.dst))
+            elif cmd=="nvread":
+                if "0x" in args.nvitem:
+                    nvitem = int(args.nvitem, 16)
+                else:
+                    nvitem = int(args.nvitem)
+                diag.print_nvitem(nvitem)
+            elif cmd=="nvreadsub":
+                if args.nvitem is None or args.nvindex is None:
+                    print("Usage: nvreadsub [nvitem] [nvindex]")
+                    exit(1)
+                nv = args.nvreadsub.split(",")
+                if "0x" in args.nvitem:
+                    nvitem = int(args.nvitem, 16)
+                else:
+                    nvitem = int(args.nvitem)
+                if "0x" in nv[1]:
+                    nvindex = int(args.nvindex, 16)
+                else:
+                    nvindex = int(args.nvindex)
+                diag.print_nvitemsub(nvitem,nvindex)
+            elif cmd=="nvwrite":
+                if args.data is None:
+                    print("NvWrite requires data to write")
+                    sys.exit()
+                if "0x" in args.nvitem:
+                    nvitem = int(args.nvitem, 16)
+                else:
+                    nvitem = int(args.nvitem)
+                data = unhexlify(args.data)
+                diag.write_nvitem(nvitem, data)
+            elif cmd=="nvwritesub":
+                if args.nvitem is None or args.nvindex is None or args.data is None:
+                    print("NvWriteSub requires item, index and data to write")
+                    sys.exit()
+                if "0x" in args.nvitem:
+                    nvitem = int(args.nvitem, 16)
+                else:
+                    nvitem = int(args.nvitem)
+                if "0x" in args.nvindex:
+                    nvindex = int(args.nvindex, 16)
+                else:
+                    nvindex = int(args.nvindex)
+                data = unhexlify(args.data)
+                diag.write_nvitemsub(nvitem, nvindex, data)
+            elif cmd=="nvbackup":
+                diag.backup_nvitems(args.filename, "error.log")
+            elif cmd=="writeimei":
+                diag.write_imei(args.imei)
+            elif cmd=="efsread":
+                diag.efsread(args.filename)
+            else:
+                print("A command is required. Use -cmd \"data\" for sending requests.")
+                print()
+                print("Valid commands are:")
+                print("-------------------")
+                print("info cmd sp spc nvread nvreadsub" +
+                " nvwrite writeimei nvwritesub nvbackup efsread efsreadfile" +
+                " efslistdir download sahara crash")
+                print()
+            diag.disconnect()
+            sys.exit()
+        else:
+            print("No diag device detected. Use -pid and -vid options. See -h for help.")
+            diag.disconnect()
+            sys.exit()
+
+
+def main():
+    info = "Qualcomm Diag Client (c) B.Kerler 2019-2021."
+    parser = argparse.ArgumentParser(description=info)
+    print("\n" + info + "\n---------------------------------------\n")
+    parser.add_argument("-vid", metavar="<vid>", help="[Option] Specify vid", default="")
+    parser.add_argument("-pid", metavar="<pid>", help="[Option] Specify pid", default="")
+    parser.add_argument("-interface", metavar="<pid>", help="[Option] Specify interface number, default=0)",
+                        default="0")
+    parser.add_argument("--debugmode", help="[Option] Enable verbose logging", action="store_true")
+
+    subparser = parser.add_subparsers(dest="cmd", help="Valid commands are:\ninfo cmd sp spc nvread nvreadsub" +
+                                                        " nvwrite writeimei nvwritesub nvbackup efsread efsreadfile\n" +
+                                                        " efslistdir download sahara crash")
+
+    parser_info = subparser.add_parser("info", help="[Option] Get diag info")
+
+    parser_cmd = subparser.add_parser("cmd", help="Send command")
+    parser_cmd.add_argument("cmdval", help="cmd to send (hexstring), default: 00",
+                           default="", const="00", nargs="?")
+
+    parser_sp = subparser.add_parser("sp", help="Send Security password")
+    parser_sp.add_argument("spval", help="Security password to send, default: FFFFFFFFFFFFFFFE",
+                        default="FFFFFFFFFFFFFFFE", nargs="?")
+
+    parser_spc = subparser.add_parser("spc", help="Send Security Code")
+    parser_spc.add_argument("spcval", help="Security code to send, default: 303030303030",
+                        default="303030303030", nargs="?")
+
+    parser_nvread = subparser.add_parser("nvread", help="Read nvitem")
+    parser_nvread.add_argument("nvitem", help="[Option] NVItem to read", default="")
+
+    parser_nvreadsub = subparser.add_parser("nvreadsub", help="Read nvitem using subsystem")
+    parser_nvreadsub.add_argument("nvitem", help="[Option] NVItem to read", default="")
+    parser_nvreadsub.add_argument("nvindex", help="[Option] Index to read", default="")
+
+    parser_nvwrite = subparser.add_parser("nvwrite", help="Write nvitem")
+    parser_nvwrite.add_argument("nvitem", help="[Option] NVItem to write", default="")
+    parser_nvwrite.add_argument("data", help="[Option] Data to write", default="")
+
+    parser_nvwritesub = subparser.add_parser("nvwritesub", help="Write nvitem using subsystem")
+    parser_nvwritesub.add_argument("nvitem", help="[Option] NVItem to read", default="")
+    parser_nvwritesub.add_argument("nvindex", help="[Option] Index to read", default="")
+    parser_nvwritesub.add_argument("data", help="[Option] Data to write", default="")
+
+    parser_writeimei = subparser.add_parser("writeimei", help="Write imei")
+    parser_writeimei.add_argument("imei", metavar=("<imei1,imei2,...>"), help="[Option] IMEI to write", default="")
+
+
+    parser_nvbackup = subparser.add_parser("nvbackup", help="Make nvitem backup as json")
+    parser_nvbackup.add_argument("filename", help="[Option] Filename to write to", default="")
+
+    parser_efsread = subparser.add_parser("efsread", help="Read efs")
+    parser_efsread.add_argument("filename", help="[Option] Filename to write to", default="")
+
+    parser_efsreadfile = subparser.add_parser("efsreadfile", help="Read efs file")
+    parser_efsreadfile.add_argument("src", help="[Option] Source filename", default="")
+    parser_efsreadfile.add_argument("dst", help="[Option] Destination filename", default="")
+
+    parser_efslistdir = subparser.add_parser("efslistdir", help="List efs directory")
+    parser_efslistdir.add_argument("path", help="[Option] Path to list", default="")
+
+    parser_download = subparser.add_parser("download", help="[Option] Switch to sahara mode")
+
+    parser_sahara = subparser.add_parser("sahara", help="[Option] Switch to sahara mode")
+
+    parser_crash = subparser.add_parser("crash", help="[Option] Enforce crash")
+
+
+    args = parser.parse_args()
+    dg = DiagTools()
+    dg.run(args)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+==================================================
+FILE: edl.py
+==================================================
+#!/usr/bin/env python3
+# Qualcomm Sahara / Firehose Client (c) B.Kerler 2018-2021
+# Licensed under MIT License
+"""
+Usage:
+    edl.py -h | --help
+    edl.py [--vid=vid] [--pid=pid]
+    edl.py [--loader=filename] [--memory=memtype]
+    edl.py [--debugmode]
+    edl.py [--gpt-num-part-entries=number] [--gpt-part-entry-size=number] [--gpt-part-entry-start-lba=number]
+    edl.py [--memory=memtype] [--skipstorageinit] [--maxpayload=bytes] [--sectorsize==bytes]
+    edl.py server [--tcpport=portnumber] [--loader=filename] [--debugmode] [--skipresponse] [--vid=vid] [--pid=pid] [--devicemodel=value]
+    edl.py memorydump [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py printgpt [--memory=memtype] [--lun=lun] [--sectorsize==bytes] [--loader=filename] [--debugmode]  [--skipresponse] [--vid=vid] [--pid=pid]
+    edl.py gpt <directory> [--memory=memtype] [--lun=lun] [--genxml] [--loader=filename]  [--skipresponse] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py r <partitionname> <filename> [--memory=memtype] [--sectorsize==bytes] [--lun=lun] [--loader=filename]  [--skipresponse] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py rl <directory> [--memory=memtype] [--lun=lun] [--sectorsize==bytes] [--skip=partnames] [--genxml]  [--skipresponse] [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py rf <filename> [--memory=memtype] [--lun=lun] [--sectorsize==bytes] [--loader=filename] [--debugmode]  [--skipresponse] [--vid=vid] [--pid=pid]
+    edl.py rs <start_sector> <sectors> <filename> [--lun=lun] [--sectorsize==bytes] [--memory=memtype] [--loader=filename] [--debugmode] [--skipresponse] [--vid=vid] [--pid=pid]
+    edl.py w <partitionname> <filename> [--partitionfilename=filename] [--memory=memtype] [--lun=lun] [--sectorsize==bytes] [--skipwrite] [--skipresponse] [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid] [--devicemodel=value]
+    edl.py wl <directory> [--memory=memtype] [--lun=lun] [--sectorsize==bytes] [--skip=partnames] [--skipresponse] [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid] [--devicemodel=value]
+    edl.py wf <filename> [--memory=memtype] [--lun=lun] [--sectorsize==bytes] [--loader=filename] [--skipresponse] [--debugmode] [--vid=vid] [--pid=pid] [--devicemodel=value]
+    edl.py ws <start_sector> <filename> [--memory=memtype] [--lun=lun] [--sectorsize==bytes] [--skipwrite] [--skipresponse] [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid] [--devicemodel=value]
+    edl.py e <partitionname> [--memory=memtype] [--skipwrite] [--lun=lun] [--sectorsize==bytes] [--loader=filename] [--debugmode] [--skipresponse] [--vid=vid] [--pid=pid] [--devicemodel=value]
+    edl.py es <start_sector> <sectors> [--memory=memtype] [--lun=lun] [--sectorsize==bytes] [--skipwrite] [--loader=filename] [--skipresponse] [--debugmode] [--vid=vid] [--pid=pid] [--devicemodel=value]
+    edl.py ep <partitionname> <sectors> [--memory=memtype] [--skipwrite] [--lun=lun] [--sectorsize==bytes] [--loader=filename] [--debugmode] [--skipresponse] [--vid=vid] [--pid=pid] [--devicemodel=value]
+    edl.py footer <filename> [--memory=memtype] [--lun=lun] [--loader=filename] [--debugmode] [--skipresponse] [--vid=vid] [--pid=pid]
+    edl.py peek <offset> <length> <filename> [--loader=filename] [--debugmode] [--skipresponse] [--vid=vid] [--pid=pid]
+    edl.py peekhex <offset> <length> [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py peekdword <offset> [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py peekqword <offset> [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py memtbl <filename> [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py poke <offset> <filename> [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py pokehex <offset> <data> [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py pokedword <offset> <data> [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py pokeqword <offset> <data> [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py memcpy <offset> <size> [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py secureboot [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py pbl <filename> [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py qfp <filename> [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py getstorageinfo [--loader=filename] [--memory=memtype] [--debugmode] [--skipresponse] [--vid=vid] [--pid=pid]
+    edl.py setbootablestoragedrive <lun> [--loader=filename] [--debugmode] [--skipresponse] [--vid=vid] [--pid=pid]
+    edl.py send <command> [--loader=filename] [--debugmode] [--skipresponse] [--vid=vid] [--pid=pid]
+    edl.py xml <xmlfile> [--loader=filename] [--debugmode] [--skipresponse] [--vid=vid] [--pid=pid] [--devicemodel=value]
+    edl.py rawxml <xmlstring> [--loader=filename] [--debugmode] [--skipresponse] [--vid=vid] [--pid=pid] [--devicemodel=value]
+    edl.py reset [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py nop [--loader=filename] [--debugmode] [--vid=vid] [--pid=pid]
+    edl.py modules <command> <options> [--memory=memtype] [--lun=lun] [--loader=filename] [--debugmode] [--skipresponse] [--vid=vid] [--pid=pid] [--devicemodel=value]
+    edl.py qfil <rawprogram> <patch> <imagedir> [--loader=filename] [--memory=memtype] [--debugmode] [--skipresponse] [--vid=vid] [--pid=pid]
+
+Description:
+    server                      # Run tcp/ip server
+    printgpt                    # Print GPT Table information
+    gpt                         # Save gpt table to given directory
+    r                           # Read flash to filename
+    rl                          # Read all partitions from flash to a directory
+    rf                          # Read whole flash to file
+    rs                          # Read sectors starting at start_sector to filename
+    w                           # Write filename to partition to flash
+    wl                          # Write all files from directory to flash
+    wf                          # Write whole filename to flash
+    ws                          # Write filename to flash at start_sector
+    e                           # Erase partition from flash
+    es                          # Erase sectors at start_sector from flash
+    ep                          # Erase sector count from flash partition
+    footer                      # Read crypto footer from flash
+    peek                        # Dump memory at offset with given length to filename
+    peekhex                     # Dump memory at offset and given length
+    peekdword                   # Dump DWORD at memory offset
+    peekqword                   # Dump QWORD at memory offset
+    memtbl                      # Dump memory table to file
+    poke                        # Write filename to memory at offset to memory
+    pokehex                     # Write hex string data at offset to memory
+    pokedword                   # Write DWORD to memory at offset
+    pokeqword                   # Write QWORD to memory at offset
+    memcpy                      # Copy memory from srcoffset with given size to dstoffset
+    secureboot                  # Print secureboot fields from qfprom fuses
+    pbl                         # Dump primary bootloader to filename
+    qfp                         # Dump QFPROM fuses to filename
+    getstorageinfo              # Print storage info in firehose mode
+    setbootablestoragedrive     # Change bootable storage drive to lun number
+    send                        # Send firehose command
+    xml                         # Send firehose xml file
+    rawxml                      # Send firehose xml raw string
+    reset                       # Send firehose reset command
+    nop                         # Send firehose nop command
+    modules                     # Enable submodules, for example: "oemunlock enable"
+    qfil                        # Write rawprogram xml files
+                                # <rawprogram> : program config xml, such as rawprogram_unsparse.xml or rawprogram*.xml
+                                # <patch> : patch config xml, such as patch0.xml or patch*.xml
+                                # <imagedir> : directory name of image files
+
+Options:
+    --loader=filename                  Use specific EDL loader, disable autodetection [default: None]
+    --vid=vid                          Set usb vendor id used for EDL [default: -1]
+    --pid=pid                          Set usb product id used for EDL [default: -1]
+    --lun=lun                          Set lun to read/write from (UFS memory only)
+    --maxpayload=bytes                 Set the maximum payload for EDL [default: 0x100000]
+    --sectorsize=bytes                 Set default sector size
+    --memory=memtype                   Set memory type ("NAND", "eMMC", "UFS", "spinor")
+    --partitionfilename=filename       Set partition table as filename for streaming mode
+    --skipwrite                        Do not allow any writes to flash (simulate only)
+    --skipresponse                     Do not expect a response from phone on read/write (some Qualcomms)
+    --skipstorageinit                  Skip storage initialisation
+    --debugmode                        Enable verbose mode
+    --gpt-num-part-entries=number      Set GPT entry count [default: 0]
+    --gpt-part-entry-size=number       Set GPT entry size [default: 0]
+    --gpt-part-entry-start-lba=number  Set GPT entry start lba sector [default: 0]
+    --tcpport=portnumber               Set port for tcp server [default: 1340]
+    --skip=partnames                   Skip reading partition with names "partname1,partname2,etc."
+    --genxml                           Generate rawprogram[lun].xml
+    --devicemodel=value                Set device model
+"""
+
+import os
+import sys
+import time
+import logging
+import subprocess
+import re
+from docopt import docopt
+from edl.Config.usb_ids import default_ids
+from edl.Library.utils import LogBase
+from edl.Library.usblib import UsbClass
+from edl.Library.sahara import sahara
+from edl.Library.streaming_client import streaming_client
+from edl.Library.firehose_client import firehose_client
+from edl.Library.streaming import Streaming
+from binascii import hexlify
+
+args = docopt(__doc__, version='3')
+
+print("Qualcomm Sahara / Firehose Client V3.52 (c) B.Kerler 2018-2021.")
+
+
+def parse_cmd(rargs):
+    cmds = ["server", "printgpt", "gpt", "r", "rl", "rf", "rs", "w", "wl", "wf", "ws", "e", "es", "ep", "footer",
+            "peek", "peekhex",
+            "peekdword", "peekqword", "memtbl", "poke", "pokehex", "pokedword", "pokeqword", "memcpy", "secureboot",
+            "pbl",
+            "qfp", "getstorageinfo", "setbootablestoragedrive", "send", "xml", "rawxml", "reset", "nop", "modules",
+            "memorydump", "qfil"]
+    for cmd in cmds:
+        if rargs[cmd]:
+            return cmd
+    return ""
+
+
+def console_cmd(cmd):
+    read = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, close_fds=True)
+    output = read.stdout.read().decode()
+    return output
+
+
+def parse_option(rargs):
+    options = {}
+    for arg in rargs:
+        if "--" in arg or "<" in arg:
+            options[arg] = rargs[arg]
+    return options
+
+
+class main(metaclass=LogBase):
+    def __init__(self):
+        self.__logger = self.__logger
+        self.info = self.__logger.info
+        self.debug = self.__logger.debug
+        self.error = self.__logger.error
+        self.warning = self.__logger.warning
+        self.cdc = None
+        self.sahara = None
+
+    def doconnect(self, loop, mode, resp):
+        while not self.cdc.connected:
+            self.cdc.connected = self.cdc.connect()
+            if not self.cdc.connected:
+                sys.stdout.write('.')
+                if loop == 5:
+                    sys.stdout.write('\n')
+                    self.info("Hint:   Press and hold vol up+dwn, connect usb. For some, only use vol up.")
+                    self.info("Xiaomi: Press and hold vol dwn + pwr, in fastboot mode connect usb.\n" +
+                              "        Run \"./fastpwn oem edl\".")
+                    self.info("Other:  Run \"adb reboot edl\".")
+                    sys.stdout.write('\n')
+
+                if loop >= 20:
+                    sys.stdout.write('\n')
+                    loop = 6
+                loop += 1
+                time.sleep(1)
+                sys.stdout.flush()
+            else:
+                self.info("Device detected :)")
+                try:
+                    mode, resp = self.sahara.connect()
+                except Exception as err:  # pylint: disable=broad-except
+                    self.debug(str(err))
+                    if mode == "" or resp == -1:
+                        mode, resp = self.sahara.connect()
+                if mode == -1:
+                    mode, resp = self.sahara.connect()
+                if mode == "":
+                    self.info("Unknown mode. Aborting.")
+                    self.exit()
+                self.info(f"Mode detected: {mode}")
+                break
+
+        return mode, resp
+
+    def exit(self):
+        self.cdc.close()
+        sys.exit()
+
+    def run(self):
+        if sys.platform == 'win32' or sys.platform == 'win64' or sys.platform == 'winnt':
+            proper_driver = console_cmd(r'reg query HKLM\HARDWARE\DEVICEMAP\SERIALCOMM')
+            if re.findall(r'QCUSB', str(proper_driver)):
+                self.warning(f'Please first install libusb_win32 driver from Zadig')
+
+        mode = ""
+        loop = 0
+        vid = int(args["--vid"], 16)
+        pid = int(args["--pid"], 16)
+        interface = -1
+        if vid != -1 and pid != -1:
+            portconfig = [[vid, pid, interface]]
+        else:
+            portconfig = default_ids
+        if args["--debugmode"]:
+            logfilename = "log.txt"
+            if os.path.exists(logfilename):
+                os.remove(logfilename)
+            fh = logging.FileHandler(logfilename)
+            self.__logger.addHandler(fh)
+            self.__logger.setLevel(logging.DEBUG)
+        else:
+            self.__logger.setLevel(logging.INFO)
+
+        self.cdc = UsbClass(portconfig=portconfig, loglevel=self.__logger.level)
+        self.sahara = sahara(self.cdc, loglevel=self.__logger.level)
+
+        if args["--loader"] == 'None':
+            self.info("Trying with no loader given ...")
+            self.sahara.programmer = ""
+        else:
+            loader = args["--loader"]
+            self.info(f"Using loader {loader} ...")
+            self.sahara.programmer = loader
+
+        self.info("Waiting for the device")
+        resp = None
+        self.cdc.timeout = 100
+        mode, resp = self.doconnect(loop, mode, resp)
+        if resp == -1:
+            mode, resp = self.doconnect(loop, mode, resp)
+            if resp == -1:
+                self.error("USB desync, please rerun command !")
+                self.exit()
+        # print((mode, resp))
+        if mode == "sahara":
+            if resp is None:
+                if mode == "sahara":
+                    print("Sahara in error state, resetting ...")
+                    self.sahara.cmd_reset()
+                    data = self.cdc.read(5)
+                    self.debug(hexlify(data).decode('utf-8'))
+                    self.exit()
+            elif "mode" in resp:
+                mode = resp["mode"]
+                if mode == self.sahara.sahara_mode.SAHARA_MODE_MEMORY_DEBUG:
+                    if args["memorydump"]:
+                        time.sleep(0.5)
+                        print("Device is in memory dump mode, dumping memory")
+                        self.sahara.debug_mode()
+                        self.exit()
+                    else:
+                        print("Device is in streaming mode, uploading loader")
+                        self.cdc.timeout = None
+                        sahara_info = self.sahara.streaminginfo()
+                        if sahara_info:
+                            mode, resp = self.sahara.connect()
+                            if mode == "sahara":
+                                mode = self.sahara.upload_loader()
+                                if "enprg" in self.sahara.programmer.lower():
+                                    mode = "load_enandprg"
+                                elif "nprg" in self.sahara.programmer.lower():
+                                    mode = "load_nandprg"
+                                elif mode != "":
+                                    mode = "load_" + mode
+                                if "load_" in mode:
+                                    time.sleep(0.3)
+                                else:
+                                    print("Error, couldn't find suitable enprg/nprg loader :(")
+                                    self.exit()
+                else:
+                    print("Device is in EDL mode .. continuing.")
+                    self.cdc.timeout = None
+                    sahara_info = self.sahara.cmd_info()
+                    if sahara_info:
+                        mode, resp = self.sahara.connect()
+                        if mode == "sahara":
+                            mode = self.sahara.upload_loader()
+                            if mode == "firehose":
+                                if "enprg" in self.sahara.programmer.lower():
+                                    mode = "enandprg"
+                                elif "nprg" in self.sahara.programmer.lower():
+                                    mode = "nandprg"
+                            if mode != "":
+                                if mode != "firehose":
+                                    streaming = Streaming(self.cdc, self.sahara, self.__logger.level)
+                                    if streaming.connect(1):
+                                        print("Successfully uploaded programmer :)")
+                                        mode = "nandprg"
+                                    else:
+                                        print("Device is in an unknown state")
+                                        self.exit()
+                                else:
+                                    print("Successfully uploaded programmer :)")
+                            else:
+                                print("No suitable loader found :(")
+                                self.exit()
+                    else:
+                        print("Device is in an unknown sahara state, resetting")
+                        print("resp={0}".format(resp))
+                        self.sahara.cmd_reset()
+                        self.exit()
+            else:
+                print("Device is in an unknown state")
+                self.exit()
+        else:
+            self.sahara.bit64 = True
+
+        if mode == "firehose":
+            self.cdc.timeout = None
+            fh = firehose_client(args, self.cdc, self.sahara, self.__logger.level, print)
+            cmd = parse_cmd(args)
+            options = parse_option(args)
+            if cmd != "":
+                fh.handle_firehose(cmd, options)
+        elif mode == "nandprg" or mode == "enandprg" or mode == "load_nandprg" or mode == "load_enandprg":
+            sc = streaming_client(args, self.cdc, self.sahara, self.__logger.level, print)
+            cmd = parse_cmd(args)
+            options = parse_option(args)
+            if "load_" in mode:
+                options["<mode>"] = 1
+            else:
+                options["<mode>"] = 0
+            sc.handle_streaming(cmd, options)
+        else:
+            self.error("Sorry, couldn't talk to Sahara, please reboot the device !")
+
+        self.exit()
+
+
+if __name__ == '__main__':
+    base = main()
+    base.run()
+
+
+==================================================
+FILE: setup.py
+==================================================
+#!/usr/bin/env python3
+from setuptools import setup, find_packages
+import os
+
+setup(
+    name='edl',
+    version='3.5',
+    packages=find_packages(),
+    long_description=open("README.md").read(),
+    scripts=['edl.py','diag.py','modem/sierrakeygen.py','modem/boottodwnload.py','modem/enableadb.py','Loaders/fhloaderparse.py','Loaders/beagle_to_loader.py'],
+    data_files = ['LICENSE','README.md'],
+    long_description_content_type="text/markdown",
+    url='https://github.com/bkerler/edl',
+    project_urls={
+        "Bug Tracker": "https://github.com/bkerler/edl/issues",
+    },
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
+    ],
+    license='MIT License',
+    install_requires=[
+    'colorama',
+    'docopt',
+    'usb',
+    'pyusb',
+    'pyserial',
+    'lxml',
+    'pylzma',
+    'pycryptodome'
+    ],
+    author='B. Kerler',
+    author_email='info@revskills.de',
+    description='Qualcomm reverse engineering and flashing tools',
+    python_requires=">=3.7",
+    include_package_data=True,
+    zip_safe=False
+)
+
+
+==================================================
+FILE: Example/tcpclient.py
+==================================================
+#!/usr/bin/env python3
+from Library.tcpclient import tcpclient
+
+class client():
+    def __init__(self):
+        self.commands=[]
+
+    def send(self):
+        self.tcp = tcpclient(1340)
+        self.tcp.sendcommands(self.commands)
+
+    def read(self,src):
+        self.commands.append(f"peekqword:{hex(src)}")
+
+    def write(self,dest,value):
+        self.commands.append(f"pokeqword:{hex(dest)},{hex(value)}")
+
+    def memcpy(self,dest,src,size):
+        self.commands.append(f"memcpy:{hex(dest)},{hex(src)},{hex(size)}")
+
+def main():
+    exp=client()
+    exp.commands = [
+        "send:nop",
+        "r:boot,boot.img",
+        "peek:0x00100000,0x8,qfp.bin"
+        #"pokehex:0x1402C2CC,1f2003d5",
+        #"peek:0x14084840,0xC00,uart.bin"
+    ]
+    exp.send()
+
+if __name__=="__main__":
+    main()
+
+
+==================================================
+FILE: Example/Library/__init__.py
+==================================================
+
+
+==================================================
+FILE: Example/Library/tcpclient.py
+==================================================
+import socket
+from binascii import hexlify
+
+class tcpclient():
+    def __init__(self, port):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_address = ("localhost", port)
+        print("connecting to %s port %s" % server_address)
+        self.sock.connect(server_address)
+
+    def sendcommands(self,commands):
+        try:
+            for command in commands:
+                self.sock.sendall(bytes(command, 'utf-8'))
+                data=""
+                while not "<ACK>" in data and not "<NAK>" in data:
+                    tmp = self.sock.recv(4096)
+                    if tmp == b"":
+                        continue
+                    try:
+                        data += tmp.decode('utf-8')
+                    except:
+                        data += hexlify(tmp)
+                print(data)
+        finally:
+            print("closing socket")
+            self.sock.close()
+
+
+
+
+==================================================
+FILE: edl/__init__.py
+==================================================
+
+
+==================================================
+FILE: edl/Config/__init__.py
+==================================================
+
+
+==================================================
+FILE: edl/Config/qualcomm_config.py
+==================================================
+vendor = {
+    0x0000: "Qualcomm     ",
+    0x0001: "Foxconn/Sony ",
+    0x0004: "ZTE          ",
+    0x0011: "Smartisan    ",
+    0x0015: "Huawei       ",
+    0x0017: "Lenovo       ",
+    0x0020: "Samsung      ",
+    0x0029: "Asus         ",
+    0x0030: "Haier        ",
+    0x0031: "LG           ",
+    0x0035: "Foxconn/Nokia",
+    0x0042: "Alcatel      ",
+    0x0045: "Nokia        ",
+    0x0048: "YuLong       ",
+    0x0051: "Oppo/Oneplus ",
+    0x0072: "Xiaomi       ",
+    0x0073: "Vivo         ",
+    0x0130: "GlocalMe     ",
+    0x0139: "Lyf          ",
+    0x0168: "Motorola     ",
+    0x01B0: "Motorola     ",
+    0x0208: "Motorola     ",
+    0x0228: "Motorola     ",
+    0x2A96: "Micromax     ",
+    0x02E8: "Lenovo       ",
+    0x0328: "Motorola     ",
+    0x0368: "Motorola     ",
+    0x03C8: "Motorola     ",
+    0x00C8: "Motorola     ",
+    0x0348: "Motorola     ",
+    0x1043: "Asus         ",
+    0x1111: "Asus         ",
+    0x143A: "Asus         ",
+    0x1978: "Blackphone   ",
+    0x2A70: "Oxygen       "
+}
+
+root_cert_hash = {
+    "secboot_sha2_pss_subca1" : "afca69d4235117e5bfc21467068b20df85e0115d7413d5821883a6d244961581",
+    "secboot_sha2_pss_subca2" : "d40eee56f3194665574109a39267724ae7944134cd53cb767e293d3c40497955bc8a4519ff992b031fadc6355015ac87",
+    "old" : "cc3153a80293939b90d02d3bf8b23e0292e452fef662c74998421adad42a380f",
+    "new" : "7be49b72f9e4337223ccb84d6eccca4e61ce16e3602ac2008cb18b75babe6d09",
+    "mdm9x60_tel" : "36c886068d9a6634e9c55185044344e9e756dcc3b5960874942c7a1a1550dee0"
+}
+
+msmids = {
+    # cc3153a80293939b90d02d3bf8b23e0292e452fef662c74998421adad42a380f pkhash/root-cert
+    # 7be49b72f9e4337223ccb84d6eccca4e61ce16e3602ac2008cb18b75babe6d09 pkhash/root-cert
+    0x9440E1: "QDF2432",
+    0x9780E1: "IPQ4018",
+    0x9790E1: "IPQ4019",
+    0x0160E1: "QCA4020",
+    0x9680E1: "APQ8009",
+    0x7060E1: "APQ8016",
+    0x8100E1: "APQ806x",
+    0x9D00E1: "APQ8076",
+    0x08A0E1: "APQ807x",
+    0x9000E1: "APQ8084",
+    0x9630E1: "APQ8092",
+    0x0940E1: "MSM8905",
+    0x9600E1: "MSM8909", # SnapDragon 210
+    0x0510E1: "MSM8909W",
+    0x7050E1: "MSM8916", # SnapDragon 410
+    0x0560E1: "MSM8917",
+    0x0860E1: "MSM8920",
+    0x91B0E1: "MSM8929",  # SnapDragon 415
+    0x04F0E1: "MSM8937",
+    0x90B0E1: "MSM8939",  # SnapDragon 610
+    0x90C0E1: "APQ8036",
+    0x90D0E1: "APQ8039",
+    0x06B0E1: "MSM8940",
+    0x9720E1: "MSM8952",  # SnapDragon 652
+    0x0460E1: "MSM8953",  # 8053lat
+    0x0660E1: "APQ8053",
+    0x9900E1: "MSM8976",  # SnapDragon 652
+    0x9690E1: "MSM8992",  # SnapDragon 82x
+    0x9400E1: "MSM8994",  # SnapDragon 808
+    0x9470E1: "MSM8996",  # SnapDragon 820
+    0x06F0E1: "MSM8996AU",
+    0x05E0E1: "MSM8998_SDM835",
+    0x94B0E1: "MSM9055",
+    0x9730E1: "MDM9206_MDM9607tx",
+    0x04A0E1: "MDM9607",
+    0x8090E1: "MDM9916",
+    0x80B0E1: "MDM9955",
+    0x9210E1: "MDM9x35",
+    0x9500E1: "MDM9x40",
+    0x9540E1: "MDM9x45",
+    0x03A0E1: "MDM9x50",
+    0x7F50E1: "MDM9x25",
+    0x0320E1: "MDM9250",  # MDM9x50
+    0x0340E1: "MDM9255",  # MDM9x55
+    0x0390E1: "MDM9350",  # MDM9x50
+    0x03B0E1: "MDM9x55",
+    0x07D0E1: "MDM9x60",  # SDX20
+    0x07F0E1: "MDM9x65",
+    0x1280E1: "fsm100xx",
+    0x1650E1: "FSM10000",
+    0x1680E1: "FSM10005",
+    0x1690E1: "FSM10010",
+    0x16A0E1: "FSM10051",
+    0x16B0E1: "FSM10056",
+    0x1530E1: "ipq5018",
+    0x1610E1: "olympic_manar",
+    0x1060E1: "qm215",
+    0x0BE0E1: "SDM429",
+    0x0BF0E1: "SDM439",
+    0x09A0E1: "SDM450",
+    0x0AC0E1: "SDM630",  #0x30070x00
+    0x0BA0E1: "SDM632",
+    0x0BB0E1: "SDA632",
+    0x08C0E1: "SDM660",  # 0x30060000 soc_hw_version
+    0x07B0E1: "SDX50M",  # 0x soc_hw_version,
+    0x0E50E1: "SDX55:CD90-PG591", # 0x600b0100 soc_hw_version, 0x8fff7000 dbgpolicy 32Bit, 0x8FCFD000 sec.elf 64Bit
+    0x0CF0E1: "SDX55M:CD90-PH809", # 0x600b0100 soc_hw_version, 0x8fff7000 dbgpolicy 32Bit, 0x8FCFD000 sec.elf 64Bit, # Netgear MR5100, sdxprairie
+    0x1250E1: "SA515M",
+
+    # afca69d4235117e5bfc21467068b20df85e0115d7413d5821883a6d244961581
+    0x0AB0E1: "QCA6290",  # 0x40040100 soc_hw_version
+    0x0D90E1: "QCA6390",  # 0x400A0000 soc_hw_version
+    0x1310E1: "QCA6480",
+    0x12E0E1: "QCA6481",
+    0x12D0E1: "QCA6491",
+    0x0D70E1: "QCA6595",  # 0x400B0000 soc_hw_version
+    0x0D30E1: "QCN7605",  # 0x400B0000 soc_hw_version
+    0x0D50E1: "QCN7606",  # 0x400B0000 soc_hw_version
+    0x0910E1: "SDM670",  # 0x60040100 soc_hw_version
+    0x0DB0E1: "SDM710",
+    0x0AA0E1: "QCS605",
+    0x0ED0E1: "SXR1120",
+    0x0EA0E1: "SXR1130",
+    0x08E0E1: "SDA845",
+
+    # d40eee56f3194665574109a39267724ae7944134cd53cb767e293d3c40497955
+    # d40eee56f3194665574109a39267724ae7944134cd53cb767e293d3c40497955bc8a4519ff992b031fadc6355015ac87 pk-hash/root-cert
+    0x1260E1: "IPQ6018",
+    0x1070E1: "MDM9205", # 0x20130100
+    0x1450E1: "agatti", # soc_vers 0x9003
+    0x13F0E1: "bitra_SDM", # soc_vers 0x6012
+    0x1410E1: "bitra_SDA",
+    0x1590E1: "cedros", # soc_vers 0x6017
+    0x1360E1: "kamorta", # soc_vers 0x9002 SnapDragon 662/460 SM4250/SM4350, bengal
+    0x1350E1: "lahaina", # soc_vers 0x600F sm8350, SDM875
+    0x1420E1: "lahaina_premier",
+    0x14A0E1: "makena", # soc_vers 0x6014
+    0x14B0E1: "SA8295P",
+    0x14C0E1: "SA8540P",
+    #0x1610E1: "mannar", # soc_vers 0x9004
+    0x1470E1: "moselle", # soc_vers 0x4014
+    0x10A0E1: "nicobar",  # 0x90010100 soc_hw_version, 0x45FFF000 sec.elf 64Bit, 0x101FF000 dbgpolicy, 64Bit
+    0x10B0E1: "qcn90xx", # soc_vers 0x400D
+    0x10C0E1: "QCN9001",
+    0x1150E1: "QCN9002",
+    0x10D0E1: "QCN9003",
+    0x10E0E1: "QCN9010",
+    0x10F0E1: "QCN9011",
+    0x1110E1: "QCN9012",
+    0x1140E1: "QCN9013",
+    0x0AF0E1: "qcs405",  # 0x20140000 soc_hw_version, 0x863DB000 sec.elf 64Bit, 0x863DE000 dbgpolicy, 64Bit
+    0x0400E1: "rennell", # soc_vers 0x600E7T A11 CB
+    0x12A0E1: "rennell",
+    0x12B0E1: "rennell_premier",
+    0x1490E1: "rennell_v1.1",
+    0x1630E1: "sd7250",
+    0x11E0E1: "saipan", # 0x600D0100 soc_hw_version, 0x808FF000 sec.elf 64Bit, 0x1C000000 dbgpolicy, 64Bit, SM7250 Snapdragon 765G
+    0x0950E1: "SM6150",  # 0x60070100 soc_hw_version, 0x85FFF000 sec.elf 64Bit, 0x1C1FF000 dbgpolicy, 64Bit
+    0x0EC0E1: "SM6150p",  # 0x60070100 soc_hw_version, 0x85FFF000 sec.elf 64Bit, 0x1C1FF000 dbgpolicy, 64Bit
+    0x0E60E1: "SM7150",  # 0x600C0100 soc_hw_version, 0x85FFF000 sec.elf 64Bit, 0x1C1FF000 dbgpolicy, 64Bit
+    0x0A50E1: "SDM855_SM8150", # Hana 0x60030100 soc_hw_version, 0x85FFF000 sec.elf 64Bit, 0x1C1FF000 dbgpolicy, 64Bit
+    0x0A60E1: "SDM855p_SM8150p", # Hana 0x60030100 soc_hw_version, 0x85FFF000 sec.elf 64Bit, 0x1C1FF000 dbgpolicy, 64Bit
+    0x0C30E1: "SM8250:CD90-PH805-1A", # Kona, 0x60080100 soc_hw_version, 0x808FF000 sec.elf 64Bit, 0x1C000000 dbgpolicy, 64Bit
+    0x0CE0E1: "SM8250:CD90-PH806-1A", # Kona 0x60080100 soc_hw_version, 0x808FF000 sec.elf 64Bit, 0x1C000000 dbgpolicy, 64Bit
+    0x0B80E1: "sc8180x", # Snapdragon 8CX
+    0x1560E1: "SM8250", # HDK 8250
+
+    # Unknown root hash
+    0x0B70E1: "SDM850",
+    0x0960E1: "SDX24",  # 0x60020100 soc_hw_version, 0x8fff7000 dbgpolicy 32Bit, 0x8FCFD000 sec.elf 64Bit
+    0x0970E1: "SDX24M", # 0x60020100 soc_hw_version, 0x8fff7000 dbgpolicy 32Bit, 0x8FCFD000 sec.elf 64Bit
+    0x0E70E1: "SM7150p", # 0x600C0100 soc_hw_version, 0x85FFF000 sec.elf 64Bit, 0x1C1FF000 dbgpolicy, 64Bit
+    0x0E80E1: "SA8155", # 0x60030100 soc_hw_version, 0x85FFF000 sec.elf 64Bit, 0x1C1FF000 dbgpolicy, 64Bit
+    0x0E90E1: "SA8155p", # 0x60030100 soc_hw_version, 0x85FFF000 sec.elf 64Bit, 0x1C1FF000 dbgpolicy, 64Bit
+    0x0E40E1: "qcs403", # 0x20140000 soc_hw_version, 0x863DB000 sec.elf 64Bit, 0x863DE000 dbgpolicy, 64Bit
+    0x1440E1: "chitwan", # soc_vers 0x6013
+    0x1370E1: "kamortap",
+    0x6220E1: "MSM7227A",
+    0x8040E1: "APQ8026",
+    0x0550E1: "APQ8017",
+    0x90F0E1: "APQ8037",
+    0x9770E1: "APQ8052",
+    0x9F00E1: "APQ8056",
+    0x7190E1: "APQ8064",
+    0x9300E1: "APQ8092",
+    0x0620E1: "APQ8098",
+    0x8110E1: "MSM8210",
+    0x8140E1: "MSM8212",
+    0x8120E1: "MSM8610",
+    0x8150E1: "MSM8612",
+    0x8010E1: "MSM8626",
+    0x8050E1: "MSM8926", # SnapDragon 400
+    0x9180E1: "MSM8928", # SnapDragon 400
+    0x7210E1: "MSM8930",
+    0x72C0E1: "MSM8960",
+    0x9B00E1: "MSM8956", # SnapDragon 652
+    0x9100E1: "MSM8962",
+    0x7B00E1: "MSM8974", # Snapdragon 800
+    0x7B30E1: "MSM8974A",
+    0x7B40E1: "MSM8974AB",
+    0x7B80E1: "MSM8974Pro",
+    0x7BC0E1: "MSM8974ABv3",
+    0x6B10E1: "MSM8974AC",
+    0x05F0E1: "MSM8996Pro", # SnapDragon 821
+    0x0480E1: "MDM9207",
+    0x0CC0E1: "SDM636",
+    0x0930E1: "SDA670",  # 0x60040100 soc_hw_version
+    #0x0930E1: "SDA835", # 0x30020000 => HW_ID1 3002000000290022
+    0x08B0E1: "SDM845",  # Napali 0x60000100 => HW_ID1 6000000000010000
+    #SDM840 NapaliQ ?
+    #SDM640 Talos ?
+}
+
+sochw = {
+    0x2013: "MDM9205",
+    0x2014: "qcs405",
+    0x2017: "IPQ6018",
+    0x3002: "MSM8998_SDM835,SDA835",
+    0x3006: "SDM660",
+    0x3007: "SDM630",
+    0x4003: "QCA4020",
+    0x4004: "IPQ8074,QCA6290",
+    0x400A: "QCA6390",
+    0x400B: "QCN7605,QCA6595,QCN7606",
+    0x400D: "qcn90xx",
+    0x4014: "moselle",
+
+    #: "SDM632",
+    #: "SDA632",
+    #: "SDM636",
+    0x6000: "SDM845",
+    0x6001: "SDA845",
+    0x6002: "SDX24,SDX24M",
+    0x6003: "SDM855_SM8150,SDM855p_SM8150p",
+    0x6004: "SDA670,SDM670,SDM710",
+    0x6005: "SDM670",
+    #: "SDX50M",
+    0x6006: "sc8180x",
+    0x6007: "SM6150,SM6150p",
+    0x6008: "SM8250:CD90-PH805-1A,SM8250:CD90-PH806-1A,SM8250",
+    0x6009: "SDM670",
+    0x600B: "SDX55:CD90-PG591,SDX55:CD90-PH809",
+    0x600C: "SM7150,SM7150p",
+    0x600D: "saipan",
+    0x600E: "rennell",
+    0x600F: "lahaina",
+    0x6012: "bitra_SDM",
+    0x6013: "chitwan",
+    0x6014: "makena",
+    0x6016: "olympic",
+    0x6017: "cedros",
+    0x9001: "nicobar",
+    0x9002: "kamorta",
+    0x9003: "agatti",
+    0x9004: "mannar"
+}
+
+secgen=[
+    # BOOT_ROM_BASE_PHYS, SECURITY_CONTROL_BASE_PHYS, MEMORY_MAP
+    [[], [0x01900000, 0x100000], []],
+    [[],[0x01e20000,0x1000],[]],
+    [[0xFC010000, 0x18000], [0xFC4B8000, 0x60F0], [0x200000, 0x24000]],
+    [[0x100000, 0x1ffb0], [0x70000, 0x6158], [0x200000, 0x24000]],
+    [[0x100000, 0x1ffb0], [0x00058000, 0x1000], [0x200000, 0x24000]],
+    [[0x100000, 0x1ffb0], [0x000A0000, 0x6FFF], [0x200000, 0x24000]],
+    [[0x100000, 0x1ffb0], [0x00700000, 0x6158], [0x200000, 0x24000]],
+    [[0x300000, 0x3c000], [0x00780000, 0x10000], [0x14009003, 0x24000]],
+    [[0x300000, 0x3c000], [0x01B40000, 0x10000], []],
+]
+
+infotbl = {
+    "QDF2432": secgen[0],
+    "QCA6290": secgen[1],
+    "QCA6390": secgen[1],
+    "QCA6480": secgen[1],
+    "QCA6481": secgen[1],
+    "QCA6490": secgen[1],
+    "QCA6491": secgen[1],
+
+    "APQ8084": secgen[2],
+    "APQ8092": secgen[2],
+    "MSM8962": secgen[2],
+    "MSM8974": secgen[2],
+    "MSM8974Pro": secgen[2],
+    "MSM8974AB": secgen[2],
+    "MSM8974ABv3": secgen[2],
+    "MSM8974AC": secgen[2],
+    "MSM8992": secgen[2],
+    "MSM8994": secgen[2],
+    "MDM9x25": secgen[2],
+    "MDM9x35": secgen[2],
+
+    "MSM8996": secgen[3],
+    "MSM8996AU": secgen[3],
+    "MSM8996Pro": secgen[3],
+
+    "IPQ4018": secgen[4],
+    "IPQ4019": secgen[4],
+    "APQ8009": secgen[4],
+    "APQ8016": secgen[4],
+    "APQ8036": secgen[4],
+    "APQ8039": secgen[4],
+    "MSM8905": secgen[4],
+    "MSM8909": secgen[4],
+    "MSM8909W": secgen[4],
+    "MSM8916": secgen[4],
+    "MSM8929": secgen[4],
+    "MSM8939": secgen[4],
+    "MSM8952": secgen[4],
+    "MDM9x40": secgen[4],
+    "MDM9x45": secgen[4],
+
+    "APQ8017": secgen[5],
+    "APQ8037": secgen[5],
+    "APQ8053": secgen[5],
+    "APQ8056": secgen[5],
+    "APQ8076": secgen[5],
+    "MSM8917": secgen[5],
+    "MSM8920": secgen[5],
+    "MSM8937": secgen[5],
+    "MSM8940": secgen[5],
+    "MSM8953": secgen[5],
+    "MSM8956": secgen[5],
+    "MSM8976": secgen[5],
+    "MSM9206": secgen[5],
+    "MDM9207": secgen[5],
+    "MDM9607": secgen[5],
+    "MDM9x50": secgen[5],
+    "MDM9x55": secgen[5],
+    "MDM9x60": secgen[5],
+    "MDM9x65": secgen[5],
+    "MDM9250": secgen[5],
+    "MDM9350": secgen[5],
+    "MDM9650": secgen[5],
+    "SDM429": secgen[5],
+    "SDM439": secgen[5],
+    "SDM450": secgen[5],
+    "SDM632": secgen[5],
+    "SDA632": secgen[5],
+    "SDX50M": secgen[5],
+    "qcs403": secgen[5],
+    "qcs405": secgen[5],
+    "ipq5018": secgen[5],
+    "ipq6018": secgen[5],
+    "qm215": secgen[5],
+
+    "APQ806x": secgen[6],
+    "MSM8930": secgen[6],
+    "MSM8936": secgen[6],
+
+    "APQ8098": secgen[7],
+    "MSM8998": secgen[7],
+    "SDM630": secgen[7],
+    "SDM636": secgen[7],
+    "SDM660": secgen[7],
+    "SDM670": secgen[7],
+    "SDA670": secgen[7],
+    "SDM710": secgen[7],
+    "QCS605": secgen[7],
+    "SXR1120": secgen[7],
+    "SXR1130": secgen[7],
+    "SDM845": secgen[7],
+    "SDA845": secgen[7],
+    "SDM850": secgen[7],
+    "SDX24": secgen[7],
+    "SDX24M": secgen[7],
+    "SDX55M": secgen[7],
+    "SDX55:CD90-PG591": secgen[7],
+    "SDX55:CD90-PH809": secgen[7],
+    "SA515M": secgen[7],
+    "SM6150": secgen[7],
+    "SM6150p": secgen[7],
+    "SM7150": secgen[7],
+    "SM7150p": secgen[7],
+    "SDM855_SM8150": secgen[7],
+    "SDM855p_SM8150p": secgen[7],
+    "SM8250": secgen[7],
+    "SM8250p": secgen[7],
+    "SM8250:CD90-PH805-1A": secgen[7],
+    "SM8250:CD90-PH806-1A": secgen[7],
+    "saipan": secgen[7],
+    "sc8180x": secgen[7],
+    "bitra": secgen[7],
+    "cedros": secgen[7],
+    "chitwan": secgen[7],
+    "lahaina": secgen[7],
+    "lahaina_premier": secgen[7],
+    "mannar": secgen[7],
+    "rennell": secgen[7],
+    "sd7250": secgen[7],
+
+    "nicobar": secgen[8],
+    "agatti": secgen[8],
+    "kamorta": secgen[8],
+    "kamortap": secgen[8],
+
+
+    # "MSM7227A": [[], [], []],
+    # "MSM8210": [[], [0xFC4B8000,0x6FFF], []],
+    # "MSM8212": [[], [], []],
+    # "MSM8610": [[], [0xFC4B8000,0x6FFF], []],
+    # "MSM8226": [[], [0xFC4B8000,0x6FFF], []],
+    # "MSM8926": [[], [0xFC4B8000,0x6FFF], []],
+    # "MSM8928": [[], [], []],
+}
+
+class memory_type:
+    nand = 0
+    emmc = 1
+    ufs = 2
+    spinor = 3
+
+    preferred_memory = {
+        "QDF2432": emmc,
+        "QCA6290": emmc,
+        "QCA6390": emmc,
+        "QCA6480": emmc,
+        "QCA6481": emmc,
+        "QCA6490": emmc,
+        "QCA6491": emmc,
+
+        "APQ8084": emmc,
+        "APQ8092": emmc,
+        "MSM8962": emmc,
+        "MSM8974": emmc,
+        "MSM8974Pro": emmc,
+        "MSM8974AB": emmc,
+        "MSM8974ABv3": emmc,
+        "MSM8974AC": emmc,
+        "MSM8992": emmc,
+        "MSM8994": emmc,
+        "MDM9x25": emmc,
+        "MDM9x35": emmc,
+
+        "MSM8996": ufs,
+        "MSM8996AU": ufs,
+        "MSM8996Pro": ufs,
+
+        "IPQ4018": emmc,
+        "IPQ4019": emmc,
+        "APQ8009": emmc,
+        "APQ8016": emmc,
+        "APQ8036": emmc,
+        "APQ8039": emmc,
+        "MSM8905": emmc,
+        "MSM8909": emmc,
+        "MSM8909W": emmc,
+        "MSM8916": emmc,
+        "MSM8929": emmc,
+        "MSM8939": emmc,
+        "MSM8952": emmc,
+        "MDM9x40": emmc,
+        "MDM9x45": emmc,
+
+        "APQ8017": emmc,
+        "APQ8037": emmc,
+        "APQ8053": emmc,
+        "APQ8056": emmc,
+        "APQ8076": emmc,
+        "MSM8917": emmc,
+        "MSM8920": emmc,
+        "MSM8937": emmc,
+        "MSM8940": emmc,
+        "MSM8953": emmc,
+        "MSM8956": emmc,
+        "MSM8976": emmc,
+        "MSM9206": emmc,
+        "MDM9207": nand,
+        "MDM9607": nand,
+        "MDM9x50": emmc,
+        "MDM9x55": emmc,
+        "MDM9x60": emmc,
+        "MDM9x65": emmc,
+        "MDM9250": emmc,
+        "MDM9350": emmc,
+        "MDM9650": emmc,
+        "SDM429": emmc,
+        "SDM439": emmc,
+        "SDM450": emmc,
+        "SDM632": emmc,
+        "SDA632": emmc,
+        "SDX50M": emmc,
+        "qcs403": emmc,
+        "qcs405": emmc,
+        "ipq5018": emmc,
+        "ipq6018": emmc,
+        "qm215": emmc,
+
+        "APQ806x": emmc,
+        "MSM8930": emmc,
+        "MSM8936": emmc,
+
+        "APQ8098": emmc,
+        "MSM8998": ufs,
+        "SDM630": emmc,
+        "SDM636": emmc,
+        "SDM660": emmc,
+        "SDM670": emmc,
+        "SDA670": emmc,
+        "SDM710": emmc,
+        "QCS605": emmc,
+        "SXR1120": emmc,
+        "SXR1130": emmc,
+        "SDM845": ufs,
+        "SDA845": ufs,
+        "SDM850": ufs,
+        "SDX24": emmc,
+        "SDX24M": emmc,
+        "SDX55M": ufs,
+        "SDX55:CD90-PG591": ufs,
+        "SDX55:CD90-PH809": ufs,
+        "SA515M": emmc,
+        "SM6150": emmc,
+        "SM6150p": emmc,
+        "SM7150": emmc,
+        "SM7150p": emmc,
+        "SDM855_SM8150": ufs,
+        "SDM855p_SM8150p": ufs,
+        "SM8250": ufs,
+        "SM8250p": ufs,
+        "SM8250:CD90-PH805-1A": ufs,
+        "SM8250:CD90-PH806-1A": ufs,
+        "saipan": ufs,
+        "sc8180x": ufs,
+        "bitra": ufs,
+        "cedros": ufs,
+        "chitwan": ufs,
+        "lahaina": ufs,
+        "lahaina_premier": ufs,
+        "mannar": ufs,
+        "rennell": ufs,
+        "sd7250": ufs,
+
+        "nicobar": ufs,
+        "agatti": ufs,
+        "kamorta": ufs,
+        "kamortap": ufs,
+
+        # "MSM7227A": [[], [], []],
+        # "MSM8210": [[], [0xFC4B8000,0x6FFF], []],
+        # "MSM8212": [[], [], []],
+        # "MSM8610": [[], [0xFC4B8000,0x6FFF], []],
+        # "MSM8226": [[], [0xFC4B8000,0x6FFF], []],
+        # "MSM8926": [[], [0xFC4B8000,0x6FFF], []],
+        # "MSM8928": [[], [], []],
+    }
+
+
+secureboottbl = {
+    "QDF2432": 0x019018c8,
+    "QCA6290": 0x01e20030,
+    "QCA6390": 0x01e20010,
+    "IPQ4018": 0x00058098,
+    "IPQ4019": 0x00058098,
+    "APQ8009": 0x00058098,
+    "APQ8016": 0x00058098,
+    "APQ8036": 0x00058098,
+    "APQ8039": 0x00058098,
+    "APQ8037": 0x000a01d0,
+    "APQ8053": 0x000a01d0,
+    "APQ8052": 0x00058098,
+    "APQ8056": 0x000a01d0,
+    "APQ8076": 0x000a01d0,
+    "APQ8084": 0xFC4B83F8,
+    "APQ8092": 0xFC4B83F8,
+    "APQ8098": 0x00780350,
+    "MSM8226": 0xFC4B83E8,
+    "MSM8610": 0xFC4B83E8,
+    "MSM8905": 0x00058098,
+    "MSM8909": 0x00058098,
+    "MSM8909W": 0x00058098,
+    "MSM8916": 0x00058098,
+    "MSM8917": 0x000A01D0,
+    "MSM8920": 0x000A01D0,
+    "MSM8929": 0x00058098,
+    "MSM8930": 0x700310,
+    "MSM8936": 0x700310,
+    "MSM8937": 0x000A01D0,
+    "MSM8939": 0x00058098,
+    "MSM8940": 0x000A01D0,
+    "MSM8952": 0x00058098,
+    "MSM8953": 0x000a01d0,
+    "MSM8956": 0x000a01d0,
+    "MSM8974": 0xFC4B83F8,
+    "MSM8974AB": 0xFC4B83F8,
+    "MSM8974ABv3": 0xFC4B83F8,
+    "MSM8974AC": 0xFC4B83F8,
+    "MSM8976": 0x000a01d0,
+    "MSM8992": 0xFC4B83F8,
+    "MSM8994": 0xFC4B83F8,
+    "MSM8996": 0x00070378,
+    "MSM8996AU": 0x00070378,
+    "MSM8996Pro": 0x00070378,
+    "MSM8998_SDM835": 0x00780350,
+    "MDM9205": 0x000a0320,
+    "MDM9206_MDM9207tx": 0x000a01d0,
+    "MDM9250": 0x000a01d0,
+    "MDM9350": 0x000a01d0,
+    "MDM9207": 0x000a01d0,
+    "MDM9607": 0x000a01d0,
+    "MDM9x25": 0xFC4B6028,
+    "MDM9x30": 0xFC4B6028,
+    "MDM9x35": 0xFC4B6028,
+    "MDM9x40": 0x00058098,
+    "MDM9x45": 0x00058098,
+    "MDM9650": 0x000a01d0,
+    "MDM9x50": 0x000a01d0,
+    "MDM9x55": 0x000a01d0,
+    "MDM9x60": 0x000a01d0,
+    "MDM9x65": 0x000a01d0,
+    "SDM429": 0x000a01d0,
+    "SDM439": 0x000a01d0,
+    "SDM450": 0x000a01d0,
+    "SDM630": 0x00780350,
+    "SDM632": 0x000a01d0,
+    "SDA632": 0x000a01d0,
+    "SDM636": 0x00780350,
+    "SDM660": 0x00780350,
+    "SDM670": 0x00780350, # Warlock
+    "SDA670": 0x00780350,
+    "SDM710": 0x00780350,
+    "QCS605": 0x00780350,
+    "SXR1120": 0x00780350,
+    "SXR1130": 0x00780350,
+    "SDM845": 0x00780350,
+    "SDA845": 0x00780350,
+    "SDX24" : 0x00780390,
+    "SDX24M": 0x00780390,
+    "SDX50M": 0x000a01e0,
+    "SDX55:CD90-PG591":  0x007805E8,
+    "SDX55:CD90-PH809":  0x007805E8,
+    "SDX55M" : 0x007804D0,
+    "SA515M" : 0x007804D0,
+    "SM6150": 0x00780360,
+    "SM6150p": 0x00780360,
+    "SM7150": 0x00780460,
+    "SM7150p": 0x00780460,
+    "SDM855_SM8150": 0x007804D0,
+    "SDM855p_SM8150p": 0x007804D0,
+    "SM8250:CD90-PH805-1A": 0x007805E8,
+    "SM8250:CD90-PH806-1A": 0x007805E8,
+    "agatti": 0x01B40458,
+    "bitra": 0x007804D8,
+    "bitra_SDM": 0x007804D8,
+    "bitra_SDA": 0x007804D8,
+    "cedros": 0x00780728,
+    "chitwan": 0x00780668,
+    "ipq5018": 0x000A01D0,
+    "ipq6018": 0x000A01D0,
+    "saipan": 0x007805E8,
+    "sd7250": 0x007805E8,
+    "sc8180x": 0x007805E8,
+    "qcs403": 0x000a0310,
+    "qcs405": 0x000a0310,
+    "nicobar": 0x01B40458,
+    "kamorta": 0x01B40458,
+    "kamorta_p": 0x01B40458,
+    "lahaina": 0x780668,
+    "lahaina_premier": 0x780668,
+    "mannar": 0x01B40458,
+    "qm215": 0x000a01d0,
+    "rennell":0x000780498
+    # "MSM7227A":[[], [], []],
+    # "MSM8210": [[], [], []],
+    # "MSM8212":
+    # "MSM8926": [[], [], []],
+    # "MSM8928": [[], [], []],
+}
+
